@@ -1,0 +1,48 @@
+
+# --- satellite-lab safety ---
+.venv/
+
+# secrets never committed
+dev_secrets/
+*.key
+*.pem
+*.hex
+
+# python junk
+__pycache__/
+*.pyc
+
+# local editor settings (optional)
+.vscode/
+
+# --- satellite-lab safety ---
+.venv/
+
+# secrets never committed
+dev_secrets/
+*.key
+*.pem
+*.hex
+
+# python junk
+__pycache__/
+*.pyc
+
+# local editor settings (optional)
+.vscode/
+
+# --- satellite-lab safety ---
+.venv/
+
+# secrets never committed
+dev_secrets/
+*.key
+*.pem
+*.hex
+
+# python junk
+__pycache__/
+*.pyc
+
+# local editor settings (optional)
+.vscode/
