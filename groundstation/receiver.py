@@ -1,105 +1,186 @@
 """
-AegisLEO Ground Station LoRa Test
+AegisLEO Secure Ground Station Receiver
 
 Created by: Jamie Grunewald
 Date: 2026-03-08
-System: Jetson Orin Nano Super Dev(Ground Station)
+Version: v0.3.1
 
-Purpose:
-1. Send a challenge message to the satellite over LoRa
-2. Wait for a response
-3. Print the received reply
+Purpose
+-------
+This script runs on the ground station and receives secure telemetry.
 
-This proves two-way communication over the LoRa radio link.
+What it does
+------------
+1. Read newline-delimited JSON packets from the LoRa serial link
+2. Rebuild the signed packet core
+3. Verify the ML-DSA signature
+4. If signature is valid, decrypt the AES-GCM ciphertext
+5. Parse the original CCSDS-style frame
+6. Display telemetry and packet health
 
-Ground station message:
-    "This transmission is coming to you. This transmission is coming to you."
+Security logic
+--------------
+If signature verification fails:
+    reject the packet
 
-Satellite response:
-    "You got it"
+If AES-GCM decryption/authentication fails:
+    reject the packet
+
+Only after both steps succeed do we trust the payload enough to parse it.
 """
 
-import serial   #used to talk to serial devices (USB radios)
-import time     #used for timing and delays
+from __future__ import annotations
+
+import json
+import serial
+from datetime import datetime, UTC
+
+from ccsds.frame import canonical_json_bytes, parse_json_bytes
+from crypto.aes_gcm import decrypt
+from crypto.mldsa_signatures import verify, b64d
 
 
-# -------------------------------------------------------------------
-# SERIAL DEVICE SETTINGS
-# -------------------------------------------------------------------
-
-# This is the stable device path for the LoRa adapter on the Orin.
-# Using /dev/serial/by-id prevents device name changes after reboot.
+# ---------------------------------------------------------------------
+# Serial / radio settings
+# ---------------------------------------------------------------------
+# Change this if your stable device path differs on the ground station.
 SERIAL_PORT = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AAF186928-if00"
-
-# UART communication speed.
-# This must match the configuration of the LoRa module.
 BAUD_RATE = 115200
 
+# ---------------------------------------------------------------------
+# Demo AES key
+# ---------------------------------------------------------------------
+# Must match the transmitter's key exactly.
+AES_KEY = b"0123456789ABCDEF0123456789ABCDEF"
 
-# -------------------------------------------------------------------
-# MESSAGE DEFINITIONS
-# -------------------------------------------------------------------
-
-# Message sent by the ground station to the satellite
-GROUND_MESSAGE = (
-    "This transmission is coming to you. "
-    "This transmission is coming to you.\n"
-)
+# ---------------------------------------------------------------------
+# ML-DSA algorithm
+# ---------------------------------------------------------------------
+MLDSA_ALGORITHM = "ML-DSA-65"
 
 
-# -------------------------------------------------------------------
-# OPEN SERIAL CONNECTION TO LORA MODEM
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Load the satellite public verification key
+# ---------------------------------------------------------------------
+# The ground station uses the public key to verify signatures.
+with open("keys/satellite_mldsa_public.key", "rb") as f:
+    SATELLITE_MLDSA_PUBLIC_KEY = f.read()
 
-# Create a serial object that connects to the LoRa radio.
-# timeout=1 means the read operation waits up to 1 second for data.
+
+# ---------------------------------------------------------------------
+# Open serial interface
+# ---------------------------------------------------------------------
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 
-print(f"Ground station online")
-print(f"Connected to {SERIAL_PORT} at {BAUD_RATE} baud")
+# Keep track of packet ordering
+last_sequence = None
+
+print("Ground station secure receiver online")
+print(f"Serial port: {SERIAL_PORT}")
+print(f"Baud rate  : {BAUD_RATE}")
+print("Press Ctrl+C to stop.")
 
 
-# Give the radio a moment to stabilize before sending traffic
-time.sleep(2)
+def pretty_time(epoch: int) -> str:
+    """
+    Convert a Unix epoch timestamp into a human-readable UTC string.
+    """
+    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-
-# -------------------------------------------------------------------
-# MAIN COMMUNICATION LOOP
-# -------------------------------------------------------------------
 
 while True:
+    # -------------------------------------------------------------
+    # Step 1: Read one line from the serial link
+    # -------------------------------------------------------------
+    raw_line = ser.readline()
 
-    # ---------------------------------------------------------------
-    # STEP 1: SEND MESSAGE TO SATELLITE
-    # ---------------------------------------------------------------
+    # If nothing arrived, loop again
+    if not raw_line:
+        continue
 
-    # Convert the Python string into bytes and send it over serial.
-    ser.write(GROUND_MESSAGE.encode("utf-8"))
+    try:
+        # ---------------------------------------------------------
+        # Step 2: Parse the transmitted JSON envelope
+        # ---------------------------------------------------------
+        packet = json.loads(raw_line.decode("utf-8"))
 
-    # Flush ensures the data leaves the USB buffer immediately.
-    ser.flush()
+        # ---------------------------------------------------------
+        # Step 3: Rebuild the exact packet_core that was signed
+        # ---------------------------------------------------------
+        # This must match the sender's signed structure exactly.
+        packet_core = {
+            "spacecraft_id": packet["spacecraft_id"],
+            "algorithms": packet["algorithms"],
+            "nonce": packet["nonce"],
+            "ciphertext": packet["ciphertext"],
+        }
 
-    print("GROUND TX:", GROUND_MESSAGE.strip())
+        # ---------------------------------------------------------
+        # Step 4: Verify ML-DSA signature
+        # ---------------------------------------------------------
+        is_valid = verify(
+            canonical_json_bytes(packet_core),
+            b64d(packet["signature"]),
+            SATELLITE_MLDSA_PUBLIC_KEY,
+            algorithm=MLDSA_ALGORITHM,
+        )
 
+        if not is_valid:
+            print("[GROUND] REJECTED: ML-DSA signature verification failed")
+            continue
 
-    # ---------------------------------------------------------------
-    # STEP 2: WAIT FOR RESPONSE FROM SATELLITE
-    # ---------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Step 5: Decrypt AES-GCM ciphertext
+        # ---------------------------------------------------------
+        # Must use the same AAD as the transmitter.
+        plaintext = decrypt(
+            b64d(packet["nonce"]),
+            b64d(packet["ciphertext"]),
+            AES_KEY,
+            aad=packet["spacecraft_id"].encode("utf-8"),
+        )
 
-    # We will listen for up to 3 seconds for the satellite reply.
-    start_time = time.time()
+        # ---------------------------------------------------------
+        # Step 6: Parse the original frame
+        # ---------------------------------------------------------
+        frame = parse_json_bytes(plaintext)
 
-    while time.time() - start_time < 3:
+        # ---------------------------------------------------------
+        # Step 7: Sequence / packet-loss tracking
+        # ---------------------------------------------------------
+        sequence = int(frame["sequence"])
+        gap = 0
 
-        # Read a line of incoming data from the radio
-        data = ser.readline()
+        if last_sequence is not None and sequence > last_sequence + 1:
+            gap = sequence - last_sequence - 1
 
-        if data:
+        last_sequence = sequence
 
-            # Convert received bytes into readable text
-            msg = data.decode("utf-8", errors="replace").strip()
+        # ---------------------------------------------------------
+        # Step 8: Pull out payload fields for easier display
+        # ---------------------------------------------------------
+        payload = frame["payload"]
 
-            print("GROUND RX:", msg)
+        # ---------------------------------------------------------
+        # Step 9: Display a clean operator view
+        # ---------------------------------------------------------
+        print("=" * 72)
+        print("AegisLEO Secure Telemetry Packet")
+        print(f"Spacecraft : {frame['spacecraft_id']}")
+        print(f"Timestamp  : {pretty_time(frame['timestamp'])}")
+        print(f"APID       : {frame['apid']}")
+        print(f"Sequence   : {sequence}")
+        print(f"Gap        : {gap}")
+        print("Crypto     : signature=VALID, decrypt=SUCCESS")
+        print(
+            f"Payload    : temp_c={payload['temp_c']} "
+            f"bus_v={payload['bus_v']} "
+            f"bus_i={payload['bus_i']} "
+            f"state={payload['state']}"
+        )
+        print("=" * 72)
 
-    # Wait before sending the next message
-    time.sleep(2)
+    except Exception as exc:
+        # Any issue in parsing, verification, decryption, or field handling
+        # will land here and be reported.
+        print(f"[GROUND] WARN: packet processing failed: {exc}")
