@@ -1,7 +1,9 @@
 """
 AegisLEO Ground Station LoRa Test
 
-This script runs on the Jetson Orin ground station.
+Created by: Jamie Grunewald
+Date: 2026-03-08
+System: Jetson Orin Nano Super Dev(Ground Station)
 
 Purpose:
 1. Send a challenge message to the satellite over LoRa
