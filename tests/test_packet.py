@@ -8,32 +8,35 @@ Unit tests help us prove two key properties:
 Later, we will add tests for AES-GCM authentication failures too.
 """
 
-from common.packet import Packet, encode_telemetry_json, decode_telemetry_json, now_ms
+# from common.packet import Packet, encode_telemetry_json, decode_telemetry_json, now_ms
+from ccsds.packet import build_frame, canonical_json_bytes, parse_json_bytes
 
 
-def test_packet_roundtrip():
-    payload = encode_telemetry_json({"hello": "world", "n": 1})
-    pkt = Packet(apid=1, seq=7, ts_ms=now_ms(), flags=0, payload=payload)
+def test_build_frame_has_expected_fields():
+    frame = build_frame(
+        spacecraft_id="AegisLEO-SAT-1",
+        sequence=7,
+        apid=100,
+        payload={"temp_c": 12.3, "bus_v": 5.01},
+    )
 
-    raw = pkt.to_bytes()
-    pkt2 = Packet.from_bytes(raw)
+    assert frame["version"] == 1
+    assert frame["spacecraft_id"] == "AegisLEO-SAT-1"
+    assert frame["sequence"] == 7
+    assert frame["apid"] == 100
+    assert "timestamp" in frame
+    assert frame["payload"]["temp_c"] == 12.3
 
-    assert pkt2.apid == pkt.apid
-    assert pkt2.seq == pkt.seq
-    assert decode_telemetry_json(pkt2.payload) == {"hello": "world", "n": 1}
 
+def test_canonical_json_roundtrip():
+    frame = build_frame(
+        spacecraft_id="AegisLEO-SAT-1",
+        sequence=8,
+        apid=100,
+        payload={"temp_c": 13.4},
+    )
 
-def test_crc_catches_tamper():
-    payload = encode_telemetry_json({"x": 123})
-    pkt = Packet(apid=2, seq=1, ts_ms=now_ms(), flags=0, payload=payload)
+    raw = canonical_json_bytes(frame)
+    parsed = parse_json_bytes(raw)
 
-    raw = bytearray(pkt.to_bytes())
-
-    # Flip one bit in the payload, simulating a tamper/corruption event.
-    raw[-1] ^= 0x01
-
-    try:
-        Packet.from_bytes(bytes(raw))
-        assert False, "expected CRC error, but parsing succeeded"
-    except ValueError as e:
-        assert "crc mismatch" in str(e)
+    assert parsed == frame

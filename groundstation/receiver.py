@@ -38,6 +38,7 @@ from datetime import datetime, UTC
 from ccsds.frame import canonical_json_bytes, parse_json_bytes
 from crypto.aes_gcm import decrypt
 from crypto.mldsa_signatures import verify, b64d
+from groundstation.replay_window import ReplayWindow
 
 
 # ---------------------------------------------------------------------
@@ -70,10 +71,12 @@ with open("keys/satellite_mldsa_public.key", "rb") as f:
 # ---------------------------------------------------------------------
 # Open serial interface
 # ---------------------------------------------------------------------
-ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+ser_inf = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 
 # Keep track of packet ordering
-last_sequence = None
+# last_sequence = None
+replay_window = ReplayWindow(window_size=64)
+
 
 print("Ground station secure receiver online")
 print(f"Serial port: {SERIAL_PORT}")
@@ -92,7 +95,7 @@ while True:
     # -------------------------------------------------------------
     # Step 1: Read one line from the serial link
     # -------------------------------------------------------------
-    raw_line = ser.readline()
+    raw_line = ser_inf.readline()
 
     # If nothing arrived, loop again
     if not raw_line:
@@ -148,6 +151,8 @@ while True:
         # ---------------------------------------------------------
         # Step 7: Sequence / packet-loss tracking
         # ---------------------------------------------------------
+        
+        """
         sequence = int(frame["sequence"])
         gap = 0
 
@@ -155,6 +160,23 @@ while True:
             gap = sequence - last_sequence - 1
 
         last_sequence = sequence
+       """ 
+        sequence = int(frame["sequence"])
+        decision = replay_window.check(sequence)
+
+        if not decision.accepted:
+            print(
+                f"[GROUND] REJECTED: replay protection blocked packet "
+            f"(seq={sequence}, reason={decision.reason})"
+            )
+            continue
+
+        previous_max = replay_window.max_seq
+        replay_window.record(sequence)
+
+        gap = 0
+        if previous_max != -1 and sequence > previous_max + 1:
+            gap = sequence - previous_max - 1
 
         # ---------------------------------------------------------
         # Step 8: Pull out payload fields for easier display
