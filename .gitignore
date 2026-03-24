@@ -1,48 +1,52 @@
-
-# --- satellite-lab safety ---
+# ------------------------
+# Python / Virtual Env
+# ------------------------
 .venv/
-
-# secrets never committed
-dev_secrets/
-*.key
-*.pem
-*.hex
-
-# python junk
+venv/
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
 
-# local editor settings (optional)
-.vscode/
-
-# --- satellite-lab safety ---
-.venv/
-
-# secrets never committed
+# ------------------------
+# Secrets / Keys
+# ------------------------
 dev_secrets/
+keys/
 *.key
 *.pem
-*.hex
+*.crt
+*.p12
 
-# python junk
-__pycache__/
-*.pyc
+# ------------------------
+# Logs / Data Outputs
+# ------------------------
+*.log
+data/telemetry_logs/*
+data/attack_samples/*
 
-# local editor settings (optional)
+# ------------------------
+# ML Models
+# ------------------------
+*.pt
+*.pth
+*.h5
+*.onnx
+
+# ------------------------
+# Cleanup Artifacts
+# ------------------------
+_cleanup_quarantine_*/
+
+# ------------------------
+# OS / Editor Junk
+# ------------------------
+.DS_Store
+Thumbs.db
 .vscode/
+.idea/
 
-# --- satellite-lab safety ---
-.venv/
-
-# secrets never committed
-dev_secrets/
-*.key
-*.pem
-*.hex
-
-# python junk
-__pycache__/
-*.pyc
-
-# local editor settings (optional)
-.vscode/
+# ------------------------
+# Third Party
+# ------------------------
+third_party/liboqs-python/.git
