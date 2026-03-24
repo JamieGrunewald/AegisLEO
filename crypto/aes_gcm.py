@@ -1,94 +1,142 @@
 """
-crypto/aes_gcm.py
+AegisLEO AES-256-GCM Utilities
 
+Created by: Jamie Grunewald
+Date: 2026-03-08
+Version: v0.3.1
+
+Purpose
+-------
+This file provides helper functions for AES-256-GCM encryption and decryption.
+
+What AES-GCM gives us
+---------------------
 AES-GCM provides:
-- Confidentiality (encryption)
-- Integrity + authenticity (authentication tag)
+- Confidentiality  -> hides the telemetry contents
+- Integrity        -> detects tampering
+- Authenticity of ciphertext structure via auth tag
 
-Important terms:
-- Key: 32 bytes for AES-256
-- Nonce: 12 bytes recommended for GCM (must be UNIQUE per key!)
-- AAD (Additional Authenticated Data): data that is NOT encrypted but IS authenticated.
-  If AAD changes, tag verification fails.
+Important note
+--------------
+AES-GCM uses a symmetric key.
+That means BOTH sides need the same secret key.
 
-In our design:
-- We keep the packet header unencrypted so the ground station can log APID/SEQ/TS.
-- We authenticate the header by using it as AAD.
-- We encrypt the payload (JSON telemetry bytes).
+For now:
+- we use a shared demo key
+
+Later:
+- ML-KEM (FIPS 203) will establish the session key properly
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Tuple
 import os
-
-from Cryptodome.Cipher import AES
-
-
-NONCE_LEN = 12          # recommended nonce length for GCM
-TAG_LEN = 16            # 128-bit authentication tag
-
-
-@dataclass(frozen=True)
-class GcmBlob:
-    """
-    Container for AES-GCM output.
-    """
-    nonce: bytes
-    ciphertext: bytes
-    tag: bytes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 def generate_key() -> bytes:
     """
-    Generate a random 32-byte AES-256 key.
-    Store this securely (env var, vault, etc). For the demo we keep it simple.
-    """
-    return os.urandom(32)
+    Generate a fresh AES-256 key.
 
-
-def encrypt_aes_gcm(key: bytes, plaintext: bytes, aad: bytes) -> GcmBlob:
-    """
-    Encrypt plaintext using AES-GCM.
-
-    Parameters
-    ----------
-    key : bytes
-        32-byte key for AES-256
-    plaintext : bytes
-        data to encrypt (telemetry payload)
-    aad : bytes
-        authenticated but unencrypted data (packet header)
+    AES-256 means:
+    - 256-bit key
+    - 32 bytes total
 
     Returns
     -------
-    GcmBlob (nonce, ciphertext, tag)
+    bytes
+        Random 32-byte AES key.
     """
-    if len(key) != 32:
-        raise ValueError("AES-256 key must be 32 bytes")
-
-    nonce = os.urandom(NONCE_LEN)
-    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-    cipher.update(aad)
-    ciphertext, tag = cipher.encrypt_and_digest(plaintext)
-    return GcmBlob(nonce=nonce, ciphertext=ciphertext, tag=tag)
+    return AESGCM.generate_key(bit_length=256)
 
 
-def decrypt_aes_gcm(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aad: bytes) -> bytes:
+def encrypt(plaintext: bytes, key: bytes, aad: bytes | None = None) -> dict[str, bytes]:
     """
-    Decrypt + verify AES-GCM.
+    Encrypt plaintext using AES-256-GCM.
 
-    Raises ValueError if authentication fails (wrong key, tampered data, wrong AAD, etc).
+    Parameters
+    ----------
+    plaintext : bytes
+        The data we want to protect.
+        Example: the serialized CCSDS frame.
+
+    key : bytes
+        The shared AES key. Must be 32 bytes for AES-256.
+
+    aad : bytes | None
+        Additional Authenticated Data.
+        This data is NOT encrypted, but it IS integrity-protected.
+
+        If the sender uses AAD, the receiver must use the exact same AAD
+        during decryption or the packet will fail authentication.
+
+        In this project we use spacecraft_id as AAD to bind the packet
+        to the sending identity context.
+
+    Returns
+    -------
+    dict[str, bytes]
+        Dictionary containing:
+        - nonce
+        - ciphertext
+
+    About the nonce
+    ---------------
+    AES-GCM needs a unique nonce for each encryption under the same key.
+    Reusing a nonce with the same key is bad. Very bad. Glass-floor bad.
+
+    We generate a random 12-byte nonce, which is the standard size for GCM.
     """
-    if len(key) != 32:
-        raise ValueError("AES-256 key must be 32 bytes")
-    if len(nonce) != NONCE_LEN:
-        raise ValueError(f"nonce must be {NONCE_LEN} bytes")
-    if len(tag) != TAG_LEN:
-        raise ValueError(f"tag must be {TAG_LEN} bytes")
+    # Create AESGCM helper object using the provided key
+    aesgcm = AESGCM(key)
 
-    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-    cipher.update(aad)
-    plaintext = cipher.decrypt_and_verify(ciphertext, tag)
-    return plaintext
+    # Generate a fresh random nonce (12 bytes is standard for GCM)
+    nonce = os.urandom(12)
+
+    # Encrypt the plaintext
+    # The returned value includes ciphertext + authentication tag
+    ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
+
+    # Return both pieces needed by the receiver
+    return {
+        "nonce": nonce,
+        "ciphertext": ciphertext,
+    }
+
+
+def decrypt(nonce: bytes, ciphertext: bytes, key: bytes, aad: bytes | None = None) -> bytes:
+    """
+    Decrypt AES-256-GCM ciphertext.
+
+    Parameters
+    ----------
+    nonce : bytes
+        The nonce used during encryption.
+
+    ciphertext : bytes
+        The encrypted data including the GCM authentication tag.
+
+    key : bytes
+        The same AES key used for encryption.
+
+    aad : bytes | None
+        Must match the AAD used during encryption exactly.
+
+    Returns
+    -------
+    bytes
+        The decrypted plaintext.
+
+    What happens if data was tampered with?
+    ---------------------------------------
+    If the ciphertext, nonce, key, or AAD are wrong,
+    AES-GCM will raise an exception instead of returning bad plaintext.
+
+    That is one of the reasons GCM is so useful.
+    """
+    # Rebuild AES-GCM helper object with the same key
+    aesgcm = AESGCM(key)
+
+    # Attempt decryption
+    # If validation fails, this line raises an exception
+    return aesgcm.decrypt(nonce, ciphertext, aad)
