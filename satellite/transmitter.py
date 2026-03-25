@@ -212,7 +212,6 @@ while True:
     # to keep the receiver logic simple and robust.
     packet_core = {
         "type": "telemetry",
-        "spacecraft_id": SPACECRAFT_ID,
         "session_id": session.session_id,
         "nonce": b64e(encrypted["nonce"]),
         "ciphertext": b64e(encrypted["ciphertext"]),
