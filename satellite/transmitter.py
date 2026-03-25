@@ -3,7 +3,7 @@ AegisLEO Secure Satellite Telemetry Transmitter
 
 Created by: Jamie Grunewald
 Date: 2026-03-24
-Version: v0.6.1
+Version: v0.6.2
 
 Purpose
 -------
@@ -137,7 +137,8 @@ session_init_core = {
     "type": "session_init",
     "spacecraft_id": SPACECRAFT_ID,
     "session_id": session.session_id,
-    "kem_ciphertext": b64e(kem_ciphertext),
+    "kem_ciphertext": "TEST"
+    #"kem_ciphertext": b64e(kem_ciphertext),
 }
 
 session_init_bytes = canonical_json_bytes(session_init_core)
