@@ -1,26 +1,19 @@
 """
 AegisLEO Ground Station Secure Receiver
-Transport-Hardened RF Version with ACK/NACK, Strict Framing, and Reassembly Guards
+Transport-Hardened RF Version with Selective Recovery for session_init
 
 Created by: Jamie Grunewald
 Updated by: OpenAI ChatGPT
 Date: 2026-03-25
-Version: v0.11.0
+Version: v0.11.1
 
-Purpose
--------
-This script runs on the ground station and listens for incoming
-secure telemetry packets from the satellite node over a noisy LoRa
-serial bridge.
-
-Design goals for v2
+v0.11.1 patch notes
 -------------------
-1. Strict frame parsing
-2. Strong transport packet validation
-3. Separate handling for session_init vs telemetry
-4. Larger chunk tolerance via longer session TTL
-5. Safer recovery from RF garbage / partial frames
-6. Cleaner operator logs
+1. ACK moved later so we only ACK after logical packet success
+2. session_init now supports selective NACK recovery
+3. duplicate chunk handling added
+4. reassembly progress logging added
+5. stricter UTF-8 frame parsing restored
 """
 
 from __future__ import annotations
@@ -42,7 +35,6 @@ from crypto.mldsa_signatures import verify, b64d
 from groundstation.replay_window import ReplayWindow
 from models.runtime_detector import RuntimeDetector
 
-
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
@@ -54,33 +46,22 @@ MLDSA_ALGORITHM = "ML-DSA-65"
 SATELLITE_MLDSA_PUBLIC_KEY_PATH = "keys/satellite_mldsa_public.key"
 RECEIVER_KEM_PRIVATE_KEY_PATH = "dev_secrets/groundstation/receiver_kem_private.key"
 
-# Frame markers used on the RF/serial transport stream.
-FRAME_START = b"\x7E"   # ~
+FRAME_START = b"\x7E"
 FRAME_END = b"\x7F"
 
-# Safety limits for framed JSON transport packets.
-# This keeps the parser from trying to swallow giant garbage blobs.
 MAX_FRAME_JSON_BYTES = 768
 
-# Separate stale timers.
-# session_init is much larger because it carries post-quantum material.
 TELEMETRY_TTL_SECONDS = 8.0
-SESSION_INIT_TTL_SECONDS = 30.0
+SESSION_INIT_TTL_SECONDS = 60.0
 
-# NACK should stay small to avoid creating another large RF message.
 MAX_MISSING_PER_NACK = 24
 
-# Debug controls
 DEBUG_CHUNKS = True
 DEBUG_REASSEMBLY = True
 DEBUG_ACKS = True
 DEBUG_BAD_FRAMES = True
 DEBUG_SCHEMA = True
 
-
-# ---------------------------------------------------------------------
-# Load key material
-# ---------------------------------------------------------------------
 with open(SATELLITE_MLDSA_PUBLIC_KEY_PATH, "rb") as f:
     SATELLITE_MLDSA_PUBLIC_KEY = f.read()
 
@@ -88,32 +69,28 @@ with open(RECEIVER_KEM_PRIVATE_KEY_PATH, "rb") as f:
     RECEIVER_KEM_PRIVATE_KEY = f.read()
 
 
-# ---------------------------------------------------------------------
-# Reassembly helpers
-# ---------------------------------------------------------------------
 @dataclass
 class ChunkAssembly:
-    """
-    Hold the pieces of one logical packet while chunks arrive.
-
-    total_chunks
-        How many chunks should exist for this one logical packet.
-
-    parts
-        Dictionary of:
-            chunk_index -> fragment text
-
-    created_at / updated_at
-        Used to decide when an incomplete assembly has gone stale.
-    """
     total_chunks: int
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     parts: dict[int, str] = field(default_factory=dict)
 
-    def add_part(self, idx: int, data: str) -> None:
+    def add_part(self, idx: int, data: str) -> tuple[bool, bool]:
+        """
+        Returns:
+            accepted_duplicate, conflicting_duplicate
+        """
+        existing = self.parts.get(idx)
+        if existing is not None:
+            if existing == data:
+                self.updated_at = time.time()
+                return True, False
+            return False, True
+
         self.parts[idx] = data
         self.updated_at = time.time()
+        return False, False
 
     def is_complete(self) -> bool:
         return len(self.parts) == self.total_chunks
@@ -122,29 +99,15 @@ class ChunkAssembly:
         return [i for i in range(self.total_chunks) if i not in self.parts]
 
     def assemble(self) -> str:
-        """
-        Rebuild the original base64 payload in chunk order.
-        """
         return "".join(self.parts[i] for i in range(self.total_chunks))
 
 
 def b64text_to_packet(text: str) -> dict[str, Any]:
-    """
-    Convert assembled base64 text back into the original logical packet.
-
-    Reverse order:
-    1. base64 decode
-    2. zlib decompress
-    3. JSON decode
-    """
     compressed = base64.b64decode(text.encode("utf-8"), validate=True)
     raw = zlib.decompress(compressed)
     return json.loads(raw.decode("utf-8"))
 
 
-# ---------------------------------------------------------------------
-# Runtime objects
-# ---------------------------------------------------------------------
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.2)
 
 key_manager = KeyManager()
@@ -152,12 +115,7 @@ detector = RuntimeDetector()
 
 sessions: dict[str, object] = {}
 replay_windows: dict[str, ReplayWindow] = {}
-
-# Reassembly key:
-#   (chunk_type, session_id, message_id)
 reassembly_buffers: dict[tuple[str, str, int | None], ChunkAssembly] = {}
-
-# Raw byte buffer used for frame extraction.
 serial_buffer = bytearray()
 
 print("Ground station secure receiver online")
@@ -167,20 +125,11 @@ print(f"KEM alg    : {key_manager.algorithm}")
 print("Press Ctrl+C to stop.")
 
 
-# ---------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------
 def pretty_time(epoch: int) -> str:
-    """
-    Convert Unix timestamp to UTC string for clean operator display.
-    """
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def write_framed_packet(pkt: dict[str, Any]) -> None:
-    """
-    Send one control-plane packet back to the transmitter with frame markers.
-    """
     payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
     wire = FRAME_START + payload + FRAME_END
     ser.write(wire)
@@ -188,57 +137,33 @@ def write_framed_packet(pkt: dict[str, Any]) -> None:
 
 
 def send_ack(session_id: str, message_id: int | None) -> None:
-    """
-    Tell the transmitter that a full logical packet was successfully reassembled.
-    """
     pkt: dict[str, Any] = {"t": "ack", "sid": session_id}
     if message_id is not None:
         pkt["mid"] = message_id
-
     write_framed_packet(pkt)
-
     if DEBUG_ACKS:
         print(f"[GROUND][ACK] sid={session_id} mid={message_id}")
 
 
-def send_nack(session_id: str, message_id: int, missing: list[int]) -> None:
-    """
-    Tell the transmitter which telemetry chunks are missing.
-
-    This is only used for telemetry. session_init uses timeout-driven
-    full resend from the transmitter side.
-    """
+def send_nack(session_id: str, missing: list[int], message_id: int | None = None) -> None:
     compact_missing = missing[:MAX_MISSING_PER_NACK]
     pkt: dict[str, Any] = {
         "t": "nack",
         "sid": session_id,
-        "mid": message_id,
         "m": compact_missing,
     }
+    if message_id is not None:
+        pkt["mid"] = message_id
     write_framed_packet(pkt)
-
     if DEBUG_ACKS:
         print(f"[GROUND][NACK] sid={session_id} mid={message_id} missing={compact_missing}")
 
 
 def get_reassembly_ttl(message_id: int | None) -> float:
-    """
-    Session setup packets are allowed to live much longer than telemetry.
-    """
     return SESSION_INIT_TTL_SECONDS if message_id is None else TELEMETRY_TTL_SECONDS
 
 
 def cleanup_reassembly_buffers() -> None:
-    """
-    Remove stale incomplete chunk sets.
-
-    Policy
-    ------
-    - session_init (mid is None):
-      Do NOT send NACK. Let the transmitter timeout and resend the whole thing.
-    - telemetry (mid is an int):
-      Send a compact NACK for a small batch of missing chunk indexes.
-    """
     now = time.time()
     stale_keys: list[tuple[str, str, int | None]] = []
 
@@ -254,18 +179,15 @@ def cleanup_reassembly_buffers() -> None:
         buf = reassembly_buffers[key]
         missing = buf.missing_indexes()
 
-        if message_id is None:
-            if DEBUG_ACKS:
-                print(
-                    f"[GROUND][INFO] stale session_init sid={session_id} "
-                    f"missing_count={len(missing)} -> waiting for full resend"
-                )
-            del reassembly_buffers[key]
-            continue
+        if DEBUG_ACKS:
+            label = "session_init" if message_id is None else "telemetry"
+            print(
+                f"[GROUND][INFO] stale {label} sid={session_id} mid={message_id} "
+                f"have={len(buf.parts)}/{buf.total_chunks} missing_count={len(missing)}"
+            )
 
-        send_nack(session_id, message_id, missing)
+        send_nack(session_id=session_id, message_id=message_id, missing=missing)
 
-        # Keep what we already have, but refresh the timer.
         new_buf = ChunkAssembly(total_chunks=buf.total_chunks)
         new_buf.parts = dict(buf.parts)
         new_buf.updated_at = time.time()
@@ -273,20 +195,8 @@ def cleanup_reassembly_buffers() -> None:
 
 
 def validate_transport_packet(packet: dict[str, Any]) -> bool:
-    """
-    Validate the small transport packet that rides directly over RF.
-
-    Expected fields:
-        t   -> chunk type or control type
-        sid -> session id
-        mid -> message id (telemetry only)
-        i   -> chunk index
-        n   -> chunk total
-        d   -> chunk data fragment
-    """
     packet_type = packet.get("t")
 
-    # Ignore valid control packets on RX if they loop back.
     if packet_type in {"ack", "nack"}:
         return True
 
@@ -303,7 +213,6 @@ def validate_transport_packet(packet: dict[str, Any]) -> bool:
 
     if not isinstance(packet["sid"], str) or not packet["sid"]:
         return False
-
     if not isinstance(packet["d"], str) or not packet["d"]:
         return False
 
@@ -315,23 +224,15 @@ def validate_transport_packet(packet: dict[str, Any]) -> bool:
 
     if total <= 0:
         return False
-
     if idx < 0 or idx >= total:
         return False
-
     if packet_type == "tc" and "mid" not in packet:
         return False
 
     return True
 
 
-def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
-    """
-    Add one transport chunk to its reassembly bucket.
-
-    Returns the full logical packet once complete.
-    Otherwise returns None.
-    """
+def add_transport_chunk(packet: dict[str, Any]) -> tuple[str, int | None, str] | None:
     cleanup_reassembly_buffers()
 
     chunk_type = packet["t"]
@@ -348,7 +249,6 @@ def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
 
     buf = reassembly_buffers[key]
 
-    # Guard against inconsistent total count for the same logical packet.
     if buf.total_chunks != chunk_total:
         if DEBUG_SCHEMA:
             print(
@@ -358,12 +258,27 @@ def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
         del reassembly_buffers[key]
         return None
 
-    buf.add_part(chunk_index, data_fragment)
+    accepted_duplicate, conflicting_duplicate = buf.add_part(chunk_index, data_fragment)
+
+    if conflicting_duplicate:
+        print(
+            f"[GROUND][WARN] conflicting duplicate chunk sid={session_id} "
+            f"mid={message_id} idx={chunk_index} -> resetting assembly"
+        )
+        del reassembly_buffers[key]
+        return None
 
     if DEBUG_CHUNKS:
+        suffix = " DUP" if accepted_duplicate else ""
         print(
             f"[GROUND][CHUNK] t={chunk_type} sid={session_id} "
-            f"mid={message_id} idx={chunk_index}/{chunk_total - 1}"
+            f"mid={message_id} idx={chunk_index}/{chunk_total - 1}{suffix}"
+        )
+
+    if DEBUG_REASSEMBLY:
+        print(
+            f"[GROUND][REASSEMBLY] sid={session_id} mid={message_id} "
+            f"have={len(buf.parts)}/{buf.total_chunks}"
         )
 
     if not buf.is_complete():
@@ -378,35 +293,15 @@ def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
             f"mid={message_id} len={len(assembled_b64)}"
         )
 
-    # Logical packet reconstructed: ACK immediately.
-    send_ack(session_id, message_id)
-
-    try:
-        return b64text_to_packet(assembled_b64)
-    except Exception as exc:
-        print(f"[GROUND] WARN: logical packet decode failed: {exc}")
-        return None
+    return session_id, message_id, assembled_b64
 
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
-    """
-    Pull as many complete framed packets as possible out of the raw byte buffer.
-
-    Framing format
-    --------------
-    FRAME_START + JSON_BYTES + FRAME_END
-
-    This function is intentionally strict:
-    - drop noise before FRAME_START
-    - keep partial trailing frame for next read
-    - reject absurd frame sizes
-    """
     frames: list[bytes] = []
 
     while True:
         start = buffer.find(FRAME_START)
         if start == -1:
-            # No frame start at all, drop noise.
             buffer.clear()
             break
 
@@ -415,9 +310,7 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
 
         end = buffer.find(FRAME_END, 1)
         if end == -1:
-            # Incomplete frame, wait for more bytes.
             if len(buffer) > MAX_FRAME_JSON_BYTES + 2:
-                # We have too much unclosed data. Drop one byte and re-sync.
                 del buffer[0]
             break
 
@@ -437,9 +330,6 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     return frames
 
 
-# ---------------------------------------------------------------------
-# Main receive loop
-# ---------------------------------------------------------------------
 while True:
     try:
         incoming = ser.read(256)
@@ -457,7 +347,6 @@ while True:
                 text = frame_bytes.decode("utf-8").strip()
                 if not text:
                     continue
-
                 transport_packet = json.loads(text)
             except UnicodeDecodeError:
                 if DEBUG_BAD_FRAMES:
@@ -471,28 +360,86 @@ while True:
             if not validate_transport_packet(transport_packet):
                 continue
 
-            # Ignore control packets if they loop back or appear on RX side.
             if transport_packet.get("t") in {"ack", "nack"}:
                 continue
 
-            # ---------------------------------------------------------
-            # Step 1: Reassemble transport chunks into full logical packet
-            # ---------------------------------------------------------
-            packet = add_transport_chunk(transport_packet)
-            if packet is None:
+            reassembled = add_transport_chunk(transport_packet)
+            if reassembled is None:
+                continue
+
+            session_id, message_id, assembled_b64 = reassembled
+
+            try:
+                packet = b64text_to_packet(assembled_b64)
+            except Exception as exc:
+                print(
+                    f"[GROUND] WARN: logical packet decode failed "
+                    f"sid={session_id} mid={message_id}: {exc}"
+                )
+                send_nack(session_id=session_id, message_id=message_id, missing=list(range(0, 8)))
                 continue
 
             packet_type = packet.get("type")
 
-            # =========================================================
-            # SESSION INIT
-            # =========================================================
             if packet_type == "session_init":
+                try:
+                    packet_core = {
+                        "type": packet["type"],
+                        "spacecraft_id": packet["spacecraft_id"],
+                        "session_id": packet["session_id"],
+                        "kem_ciphertext": packet["kem_ciphertext"],
+                    }
+
+                    is_valid_signature = verify(
+                        canonical_json_bytes(packet_core),
+                        b64d(packet["signature"]),
+                        SATELLITE_MLDSA_PUBLIC_KEY,
+                        algorithm=MLDSA_ALGORITHM,
+                    )
+
+                    if not is_valid_signature:
+                        print("[GROUND] REJECTED: session_init signature invalid")
+                        send_nack(session_id=session_id, message_id=message_id, missing=[0])
+                        continue
+
+                    session_id = packet["session_id"]
+
+                    if session_id in sessions:
+                        print(f"[GROUND] INFO: session already exists ({session_id})")
+                        send_ack(session_id, message_id)
+                        continue
+
+                    print(f"[GROUND] Received session_init: {session_id}")
+
+                    session = key_manager.create_receiver_session(
+                        kem_ciphertext=b64d(packet["kem_ciphertext"]),
+                        receiver_private_key=RECEIVER_KEM_PRIVATE_KEY,
+                        session_id=session_id,
+                    )
+
+                    sessions[session_id] = session
+                    replay_windows[session_id] = ReplayWindow(window_size=64)
+
+                    print(f"[GROUND] Session established: {session_id}")
+                    send_ack(session_id, message_id)
+                    continue
+                except Exception as exc:
+                    print(f"[GROUND] REJECTED: session_init processing failed: {exc}")
+                    send_nack(session_id=session_id, message_id=message_id, missing=[0])
+                    continue
+
+            if packet_type != "telemetry":
+                print(f"[GROUND] WARN: unknown logical packet type: {packet_type}")
+                send_nack(session_id=session_id, message_id=message_id, missing=[0])
+                continue
+
+            try:
                 packet_core = {
                     "type": packet["type"],
                     "spacecraft_id": packet["spacecraft_id"],
                     "session_id": packet["session_id"],
-                    "kem_ciphertext": packet["kem_ciphertext"],
+                    "nonce": packet["nonce"],
+                    "ciphertext": packet["ciphertext"],
                 }
 
                 is_valid_signature = verify(
@@ -503,142 +450,87 @@ while True:
                 )
 
                 if not is_valid_signature:
-                    print("[GROUND] REJECTED: session_init signature invalid")
+                    print("[GROUND] REJECTED: telemetry signature invalid")
+                    send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
 
                 session_id = packet["session_id"]
 
-                if session_id in sessions:
-                    print(f"[GROUND] INFO: session already exists ({session_id})")
+                if session_id not in sessions:
+                    print(f"[GROUND] WARN: telemetry before session ({session_id})")
+                    send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
 
-                print(f"[GROUND] Received session_init: {session_id}")
+                session = sessions[session_id]
+                replay_window = replay_windows[session_id]
 
-                session = key_manager.create_receiver_session(
-                    kem_ciphertext=b64d(packet["kem_ciphertext"]),
-                    receiver_private_key=RECEIVER_KEM_PRIVATE_KEY,
-                    session_id=session_id,
+                if session.is_expired():
+                    print(f"[GROUND] REJECTED: session expired ({session_id})")
+                    send_nack(session_id=session_id, message_id=message_id, missing=[0])
+                    continue
+
+                plaintext = decrypt(
+                    b64d(packet["nonce"]),
+                    b64d(packet["ciphertext"]),
+                    session.aes_key,
+                    aad=packet["spacecraft_id"].encode("utf-8"),
                 )
 
-                sessions[session_id] = session
-                replay_windows[session_id] = ReplayWindow(window_size=64)
+                frame = parse_json_bytes(plaintext)
 
-                print(f"[GROUND] Session established: {session_id}")
-                continue
+                sequence = int(frame["sequence"])
 
-            # =========================================================
-            # TELEMETRY
-            # =========================================================
-            if packet_type != "telemetry":
-                print(f"[GROUND] WARN: unknown logical packet type: {packet_type}")
-                continue
+                decision = replay_window.check(sequence)
+                if not decision.accepted:
+                    print(
+                        f"[GROUND] REJECTED: replay blocked "
+                        f"(session={session_id}, seq={sequence}, reason={decision.reason})"
+                    )
+                    send_nack(session_id=session_id, message_id=message_id, missing=[0])
+                    continue
 
-            packet_core = {
-                "type": packet["type"],
-                "spacecraft_id": packet["spacecraft_id"],
-                "session_id": packet["session_id"],
-                "nonce": packet["nonce"],
-                "ciphertext": packet["ciphertext"],
-            }
+                previous_max = replay_window.max_seq
+                replay_window.record(sequence)
 
-            is_valid_signature = verify(
-                canonical_json_bytes(packet_core),
-                b64d(packet["signature"]),
-                SATELLITE_MLDSA_PUBLIC_KEY,
-                algorithm=MLDSA_ALGORITHM,
-            )
+                gap = 0
+                if previous_max != -1 and sequence > previous_max + 1:
+                    gap = sequence - previous_max - 1
 
-            if not is_valid_signature:
-                print("[GROUND] REJECTED: telemetry signature invalid")
-                continue
+                detection = detector.detect(frame)
 
-            session_id = packet["session_id"]
+                print("=" * 72)
+                print("AegisLEO Secure Telemetry Packet")
+                print(f"Spacecraft : {frame['spacecraft_id']}")
+                print(f"Session ID : {session_id}")
+                print(f"Timestamp  : {pretty_time(frame['timestamp'])}")
+                print(f"APID       : {frame['apid']}")
+                print(f"Sequence   : {sequence}")
+                print(f"Gap        : {gap}")
+                print(f"Replay     : ACCEPTED ({decision.reason})")
+                print("Crypto     : signature=VALID, session=ACTIVE, decrypt=SUCCESS")
 
-            if session_id not in sessions:
-                print(f"[GROUND] WARN: telemetry before session ({session_id})")
-                continue
+                if detection.is_anomalous:
+                    print(
+                        f"ML         : ANOMALY "
+                        f"(score={detection.score}, reasons={detection.reasons})"
+                    )
+                else:
+                    print(f"ML         : nominal (score={detection.score})")
 
-            session = sessions[session_id]
-            replay_window = replay_windows[session_id]
-
-            if session.is_expired():
-                print(f"[GROUND] REJECTED: session expired ({session_id})")
-                continue
-
-            # ---------------------------------------------------------
-            # Step 2: Decrypt logical telemetry packet
-            # ---------------------------------------------------------
-            plaintext = decrypt(
-                b64d(packet["nonce"]),
-                b64d(packet["ciphertext"]),
-                session.aes_key,
-                aad=packet["spacecraft_id"].encode("utf-8"),
-            )
-
-            # ---------------------------------------------------------
-            # Step 3: Parse decrypted CCSDS-inspired frame
-            # ---------------------------------------------------------
-            frame = parse_json_bytes(plaintext)
-
-            # ---------------------------------------------------------
-            # Step 4: Replay protection
-            # ---------------------------------------------------------
-            sequence = int(frame["sequence"])
-
-            decision = replay_window.check(sequence)
-            if not decision.accepted:
+                payload = frame["payload"]
                 print(
-                    f"[GROUND] REJECTED: replay blocked "
-                    f"(session={session_id}, seq={sequence}, reason={decision.reason})"
+                    f"Payload    : temp_c={payload['temp_c']} "
+                    f"bus_v={payload['bus_v']} "
+                    f"bus_i={payload['bus_i']} "
+                    f"state={payload['state']}"
                 )
-                continue
+                print("=" * 72)
 
-            previous_max = replay_window.max_seq
-            replay_window.record(sequence)
+                send_ack(session_id, message_id)
 
-            # ---------------------------------------------------------
-            # Step 5: Compute packet gap for operator visibility
-            # ---------------------------------------------------------
-            gap = 0
-            if previous_max != -1 and sequence > previous_max + 1:
-                gap = sequence - previous_max - 1
-
-            # ---------------------------------------------------------
-            # Step 6: Run anomaly detection
-            # ---------------------------------------------------------
-            detection = detector.detect(frame)
-
-            # ---------------------------------------------------------
-            # Step 7: Print operator view
-            # ---------------------------------------------------------
-            payload = frame["payload"]
-
-            print("=" * 72)
-            print("AegisLEO Secure Telemetry Packet")
-            print(f"Spacecraft : {frame['spacecraft_id']}")
-            print(f"Session ID : {session_id}")
-            print(f"Timestamp  : {pretty_time(frame['timestamp'])}")
-            print(f"APID       : {frame['apid']}")
-            print(f"Sequence   : {sequence}")
-            print(f"Gap        : {gap}")
-            print(f"Replay     : ACCEPTED ({decision.reason})")
-            print("Crypto     : signature=VALID, session=ACTIVE, decrypt=SUCCESS")
-
-            if detection.is_anomalous:
-                print(
-                    f"ML         : ANOMALY "
-                    f"(score={detection.score}, reasons={detection.reasons})"
-                )
-            else:
-                print(f"ML         : nominal (score={detection.score})")
-
-            print(
-                f"Payload    : temp_c={payload['temp_c']} "
-                f"bus_v={payload['bus_v']} "
-                f"bus_i={payload['bus_i']} "
-                f"state={payload['state']}"
-            )
-            print("=" * 72)
+            except Exception as exc:
+                print(f"[GROUND] REJECTED: telemetry processing failed sid={session_id} mid={message_id}: {exc}")
+                send_nack(session_id=session_id, message_id=message_id, missing=[0])
 
     except Exception as exc:
         print(f"[GROUND] WARN: {exc}")
