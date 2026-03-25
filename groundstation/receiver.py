@@ -77,7 +77,7 @@ FRAME_END = b"\x7F"
 
 # Maximum size of one framed transport JSON packet.
 # This is a safety guard so random garbage does not grow forever in memory.
-MAX_FRAME_JSON_BYTES = 2048
+MAX_FRAME_JSON_BYTES = 4096
 
 # How long to keep incomplete chunk reassembly state alive.
 # session_init gets longer because PQ material is large.

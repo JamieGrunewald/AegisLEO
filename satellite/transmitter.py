@@ -42,7 +42,7 @@ APID = 100
 SESSION_INIT_CHUNK_SIZE = 220
 TELEMETRY_CHUNK_SIZE = 180
 
-SESSION_INIT_CHUNK_DELAY_SECONDS = 0.55
+SESSION_INIT_CHUNK_DELAY_SECONDS = 0.65
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
 
 ACK_WAIT_SECONDS = 15.0
@@ -113,7 +113,7 @@ def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     wire = FRAME_START + payload + FRAME_END
     ser.write(wire)
     ser.flush()
-    time.sleep(0.01)
+    time.sleep(0.02)
 
 def send_chunk_packets(
     ser: serial.Serial,
@@ -319,7 +319,7 @@ def wait_for_ack_or_nack(
                 )
 
                 # bigger quiet window after resend
-                time.sleep(3.0)
+                time.sleep(4.0)
 
                 continue
 
