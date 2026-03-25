@@ -1,44 +1,26 @@
 """
 AegisLEO Ground Station Secure Receiver
-Chunked RF Version with ACK/NACK Reassembly Control
+Transport-Hardened RF Version with ACK/NACK, Strict Framing, and Reassembly Guards
 
 Created by: Jamie Grunewald
-Date: 2026-03-24
-Version: v0.9.0
+Updated by: OpenAI ChatGPT
+Date: 2026-03-25
+Version: v0.11.0
 
 Purpose
 -------
 This script runs on the ground station and listens for incoming
-secure telemetry packets from the satellite node.
+secure telemetry packets from the satellite node over a noisy LoRa
+serial bridge.
 
-What this version does
-----------------------
-1. Reads framed transport packets from the LoRa serial bridge
-2. Reassembles chunked logical packets
-3. Sends ACK when a full logical packet is reconstructed
-4. Sends compact NACK for missing telemetry chunks
-5. Verifies signatures on logical packets
-6. Establishes ML-KEM session from session_init
-7. Decrypts telemetry with AES-GCM
-8. Applies replay protection
-9. Runs anomaly detection
-10. Prints a clean operator view
-
-Why framing matters
+Design goals for v2
 -------------------
-LoRa transparent serial links may:
-- split packets
-- merge packets
-- inject stray bytes
-
-So we do NOT trust newline boundaries anymore.
-
-Instead, every transport packet is wrapped like:
-
-    FRAME_START + JSON_BYTES + FRAME_END
-
-The receiver scans the serial stream for those byte markers and only
-tries to parse complete framed packets.
+1. Strict frame parsing
+2. Strong transport packet validation
+3. Separate handling for session_init vs telemetry
+4. Larger chunk tolerance via longer session TTL
+5. Safer recovery from RF garbage / partial frames
+6. Cleaner operator logs
 """
 
 from __future__ import annotations
@@ -72,18 +54,28 @@ MLDSA_ALGORITHM = "ML-DSA-65"
 SATELLITE_MLDSA_PUBLIC_KEY_PATH = "keys/satellite_mldsa_public.key"
 RECEIVER_KEM_PRIVATE_KEY_PATH = "dev_secrets/groundstation/receiver_kem_private.key"
 
+# Frame markers used on the RF/serial transport stream.
+FRAME_START = b"\x7E"   # ~
+FRAME_END = b"\x7F"
+
+# Safety limits for framed JSON transport packets.
+# This keeps the parser from trying to swallow giant garbage blobs.
+MAX_FRAME_JSON_BYTES = 768
+
+# Separate stale timers.
+# session_init is much larger because it carries post-quantum material.
+TELEMETRY_TTL_SECONDS = 8.0
+SESSION_INIT_TTL_SECONDS = 30.0
+
+# NACK should stay small to avoid creating another large RF message.
+MAX_MISSING_PER_NACK = 24
+
 # Debug controls
 DEBUG_CHUNKS = True
 DEBUG_REASSEMBLY = True
 DEBUG_ACKS = True
 DEBUG_BAD_FRAMES = True
-
-# How long to keep an incomplete chunk set before declaring it stale
-REASSEMBLY_TTL_SECONDS = 5.0
-
-# Transport frame markers
-FRAME_START = b"\x7E"   # ~
-FRAME_END = b"\x7F"
+DEBUG_SCHEMA = True
 
 
 # ---------------------------------------------------------------------
@@ -103,13 +95,25 @@ with open(RECEIVER_KEM_PRIVATE_KEY_PATH, "rb") as f:
 class ChunkAssembly:
     """
     Hold the pieces of one logical packet while chunks arrive.
+
+    total_chunks
+        How many chunks should exist for this one logical packet.
+
+    parts
+        Dictionary of:
+            chunk_index -> fragment text
+
+    created_at / updated_at
+        Used to decide when an incomplete assembly has gone stale.
     """
     total_chunks: int
     created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
     parts: dict[int, str] = field(default_factory=dict)
 
     def add_part(self, idx: int, data: str) -> None:
         self.parts[idx] = data
+        self.updated_at = time.time()
 
     def is_complete(self) -> bool:
         return len(self.parts) == self.total_chunks
@@ -126,16 +130,17 @@ class ChunkAssembly:
 
 def b64text_to_packet(text: str) -> dict[str, Any]:
     """
-    Convert an assembled base64 payload back into the original logical packet.
+    Convert assembled base64 text back into the original logical packet.
 
     Reverse order:
     1. base64 decode
     2. zlib decompress
     3. JSON decode
     """
-    compressed = base64.b64decode(text.encode("utf-8"))
+    compressed = base64.b64decode(text.encode("utf-8"), validate=True)
     raw = zlib.decompress(compressed)
     return json.loads(raw.decode("utf-8"))
+
 
 # ---------------------------------------------------------------------
 # Runtime objects
@@ -152,7 +157,7 @@ replay_windows: dict[str, ReplayWindow] = {}
 #   (chunk_type, session_id, message_id)
 reassembly_buffers: dict[tuple[str, str, int | None], ChunkAssembly] = {}
 
-# Raw byte buffer used for frame extraction
+# Raw byte buffer used for frame extraction.
 serial_buffer = bytearray()
 
 print("Ground station secure receiver online")
@@ -170,15 +175,6 @@ def pretty_time(epoch: int) -> str:
     Convert Unix timestamp to UTC string for clean operator display.
     """
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def packet_to_base64_with_stats(packet: dict[str, Any]) -> tuple[str, int, int]:
-    """
-    Same as packet_to_base64(), but also return original and compressed sizes.
-    """
-    raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-    compressed = zlib.compress(raw, level=9)
-    encoded = base64.b64encode(compressed).decode("utf-8")
-    return encoded, len(raw), len(compressed)
 
 
 def write_framed_packet(pkt: dict[str, Any]) -> None:
@@ -205,28 +201,31 @@ def send_ack(session_id: str, message_id: int | None) -> None:
         print(f"[GROUND][ACK] sid={session_id} mid={message_id}")
 
 
-def send_nack(session_id: str, message_id: int | None, missing: list[int]) -> None:
+def send_nack(session_id: str, message_id: int, missing: list[int]) -> None:
     """
     Tell the transmitter which telemetry chunks are missing.
 
-    We keep NACKs intentionally small so the NACK itself does not become
-    another oversized RF message.
+    This is only used for telemetry. session_init uses timeout-driven
+    full resend from the transmitter side.
     """
-    MAX_MISSING_PER_NACK = 16
     compact_missing = missing[:MAX_MISSING_PER_NACK]
-
     pkt: dict[str, Any] = {
         "t": "nack",
         "sid": session_id,
+        "mid": message_id,
         "m": compact_missing,
     }
-    if message_id is not None:
-        pkt["mid"] = message_id
-
     write_framed_packet(pkt)
 
     if DEBUG_ACKS:
         print(f"[GROUND][NACK] sid={session_id} mid={message_id} missing={compact_missing}")
+
+
+def get_reassembly_ttl(message_id: int | None) -> float:
+    """
+    Session setup packets are allowed to live much longer than telemetry.
+    """
+    return SESSION_INIT_TTL_SECONDS if message_id is None else TELEMETRY_TTL_SECONDS
 
 
 def cleanup_reassembly_buffers() -> None:
@@ -244,8 +243,10 @@ def cleanup_reassembly_buffers() -> None:
     stale_keys: list[tuple[str, str, int | None]] = []
 
     for key, buf in reassembly_buffers.items():
-        age = now - buf.created_at
-        if age > REASSEMBLY_TTL_SECONDS and not buf.is_complete():
+        _, _, message_id = key
+        ttl = get_reassembly_ttl(message_id)
+        age = now - buf.updated_at
+        if age > ttl and not buf.is_complete():
             stale_keys.append(key)
 
     for key in stale_keys:
@@ -264,10 +265,64 @@ def cleanup_reassembly_buffers() -> None:
 
         send_nack(session_id, message_id, missing)
 
-        # Keep already-received chunks, but refresh timer
+        # Keep what we already have, but refresh the timer.
         new_buf = ChunkAssembly(total_chunks=buf.total_chunks)
         new_buf.parts = dict(buf.parts)
+        new_buf.updated_at = time.time()
         reassembly_buffers[key] = new_buf
+
+
+def validate_transport_packet(packet: dict[str, Any]) -> bool:
+    """
+    Validate the small transport packet that rides directly over RF.
+
+    Expected fields:
+        t   -> chunk type or control type
+        sid -> session id
+        mid -> message id (telemetry only)
+        i   -> chunk index
+        n   -> chunk total
+        d   -> chunk data fragment
+    """
+    packet_type = packet.get("t")
+
+    # Ignore valid control packets on RX if they loop back.
+    if packet_type in {"ack", "nack"}:
+        return True
+
+    required = {"t", "sid", "i", "n", "d"}
+    if not required.issubset(packet):
+        if DEBUG_SCHEMA:
+            print(f"[GROUND][SCHEMA] missing keys in transport packet: {packet}")
+        return False
+
+    if packet_type not in {"si", "tc"}:
+        if DEBUG_SCHEMA:
+            print(f"[GROUND][SCHEMA] invalid transport type: {packet_type}")
+        return False
+
+    if not isinstance(packet["sid"], str) or not packet["sid"]:
+        return False
+
+    if not isinstance(packet["d"], str) or not packet["d"]:
+        return False
+
+    try:
+        idx = int(packet["i"])
+        total = int(packet["n"])
+    except (TypeError, ValueError):
+        return False
+
+    if total <= 0:
+        return False
+
+    if idx < 0 or idx >= total:
+        return False
+
+    if packet_type == "tc" and "mid" not in packet:
+        return False
+
+    return True
 
 
 def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
@@ -292,6 +347,17 @@ def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
         reassembly_buffers[key] = ChunkAssembly(total_chunks=chunk_total)
 
     buf = reassembly_buffers[key]
+
+    # Guard against inconsistent total count for the same logical packet.
+    if buf.total_chunks != chunk_total:
+        if DEBUG_SCHEMA:
+            print(
+                f"[GROUND][SCHEMA] chunk total mismatch sid={session_id} "
+                f"mid={message_id} old_total={buf.total_chunks} new_total={chunk_total}"
+            )
+        del reassembly_buffers[key]
+        return None
+
     buf.add_part(chunk_index, data_fragment)
 
     if DEBUG_CHUNKS:
@@ -312,10 +378,14 @@ def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
             f"mid={message_id} len={len(assembled_b64)}"
         )
 
-    # Logical packet reconstructed: ACK immediately
+    # Logical packet reconstructed: ACK immediately.
     send_ack(session_id, message_id)
 
-    return b64text_to_packet(assembled_b64)
+    try:
+        return b64text_to_packet(assembled_b64)
+    except Exception as exc:
+        print(f"[GROUND] WARN: logical packet decode failed: {exc}")
+        return None
 
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
@@ -325,27 +395,43 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     Framing format
     --------------
     FRAME_START + JSON_BYTES + FRAME_END
+
+    This function is intentionally strict:
+    - drop noise before FRAME_START
+    - keep partial trailing frame for next read
+    - reject absurd frame sizes
     """
     frames: list[bytes] = []
 
     while True:
         start = buffer.find(FRAME_START)
         if start == -1:
-            # No frame start at all, drop noise
+            # No frame start at all, drop noise.
             buffer.clear()
             break
 
-        # Drop anything before the next valid frame start
         if start > 0:
             del buffer[:start]
 
         end = buffer.find(FRAME_END, 1)
         if end == -1:
-            # Incomplete frame, wait for more bytes
+            # Incomplete frame, wait for more bytes.
+            if len(buffer) > MAX_FRAME_JSON_BYTES + 2:
+                # We have too much unclosed data. Drop one byte and re-sync.
+                del buffer[0]
             break
 
         frame = bytes(buffer[1:end])
         del buffer[:end + 1]
+
+        if not frame:
+            continue
+
+        if len(frame) > MAX_FRAME_JSON_BYTES:
+            if DEBUG_BAD_FRAMES:
+                print(f"[GROUND] WARN: oversized frame dropped ({len(frame)} bytes)")
+            continue
+
         frames.append(frame)
 
     return frames
@@ -368,17 +454,24 @@ while True:
 
         for frame_bytes in frames:
             try:
-                text = frame_bytes.decode("utf-8", errors="ignore").strip()
+                text = frame_bytes.decode("utf-8").strip()
                 if not text:
                     continue
 
                 transport_packet = json.loads(text)
+            except UnicodeDecodeError:
+                if DEBUG_BAD_FRAMES:
+                    print(f"[GROUND] WARN: non-UTF8 frame dropped: {frame_bytes[:80]!r}")
+                continue
             except json.JSONDecodeError:
                 if DEBUG_BAD_FRAMES:
                     print(f"[GROUND] WARN: invalid framed JSON: {frame_bytes[:80]!r}")
                 continue
 
-            # Ignore control packets if they loop back or appear on RX side
+            if not validate_transport_packet(transport_packet):
+                continue
+
+            # Ignore control packets if they loop back or appear on RX side.
             if transport_packet.get("t") in {"ack", "nack"}:
                 continue
 

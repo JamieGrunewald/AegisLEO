@@ -1,51 +1,24 @@
 """
 AegisLEO Secure Satellite Telemetry Transmitter
-Chunked RF Version with ACK/NACK Retransmission + Compression
+Transport-Hardened RF Version with ACK/NACK, Separate Control/Data Tuning, and Compression
 
 Created by: Jamie Grunewald
-Date: 2026-03-24
-Version: v0.10.0
+Updated by: OpenAI ChatGPT
+Date: 2026-03-25
+Version: v0.11.0
 
 Purpose
 -------
 This script runs on the satellite-side node and sends secure telemetry
 to the ground station over the LoRa serial link.
 
-What this version does
-----------------------
-1. Builds signed logical packets
-2. Encrypts telemetry with AES-GCM
-3. Compresses logical packets with zlib
-4. Encodes compressed bytes as base64 text
-5. Splits that text into RF-safe chunks
-6. Frames every transport packet with start/end markers
-7. Waits for ACK/NACK from the ground station
-8. Retransmits as needed
-
-Why compression matters
------------------------
-JSON packets are text-heavy and repetitive.
-Compression shrinks the logical packet before chunking.
-
-That usually means:
-- fewer RF chunks
-- fewer retransmissions
-- better chance of full delivery over LoRa
-
-Why framing matters
+Design goals for v2
 -------------------
-The LoRa serial bridge may:
-- split packets
-- merge packets
-- inject stray bytes
-
-So we do NOT trust newline boundaries anymore.
-
-Instead, every transport packet is wrapped like:
-
-    FRAME_START + JSON_BYTES + FRAME_END
-
-The transmitter also parses ACK/NACK using the same framing.
+1. Larger chunks to reduce packet explosion
+2. Separate tuning for session_init vs telemetry
+3. Strict control-frame parsing
+4. Better operator visibility into packet sizes
+5. Cleaner retransmission logic
 """
 
 from __future__ import annotations
@@ -75,23 +48,34 @@ BAUD_RATE = 115200
 SPACECRAFT_ID = "AegisLEO-SAT-1"
 APID = 100
 
-# RF-safe chunk tuning
-CHUNK_SIZE = 32
-CHUNK_DELAY_SECONDS = 0.15
+# Separate transport tuning.
+# session_init is large because of PQ material, so we give it its own pace.
+SESSION_INIT_CHUNK_SIZE = 160
+TELEMETRY_CHUNK_SIZE = 180
+
+SESSION_INIT_CHUNK_DELAY_SECONDS = 0.18
+TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
 
 # ACK/NACK timing
-ACK_WAIT_SECONDS = 2.0
-MAX_RETRIES = 3
+ACK_WAIT_SECONDS = 3.0
+MAX_RETRIES = 4
 
 # Transport frame markers
 FRAME_START = b"\x7E"   # ~
 FRAME_END = b"\x7F"
+
+# Safety limit for inbound control packets
+MAX_CONTROL_FRAME_JSON_BYTES = 512
 
 # Debug controls
 DEBUG_TX_CHUNKS = False
 DEBUG_ACKS = True
 DEBUG_BAD_FRAMES = True
 DEBUG_PACKET_SIZES = True
+
+# Compression level.
+# Level 6 is a good compromise between size reduction and CPU effort.
+COMPRESSION_LEVEL = 6
 
 
 # ---------------------------------------------------------------------
@@ -106,40 +90,19 @@ RECEIVER_KEM_PUBLIC_KEY_PATH = "dev_secrets/satellite/receiver_kem_public.key"
 # ---------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------
-def packet_to_base64(packet: dict[str, Any]) -> str:
+def packet_to_base64_with_stats(packet: dict[str, Any]) -> tuple[str, int, int, int]:
     """
     Convert one full logical packet into compact JSON bytes,
     compress it with zlib, then encode as base64 text.
 
-    Flow
-    ----
-    packet dict
-        -> compact JSON bytes
-        -> zlib-compressed bytes
-        -> base64 text
-
-    Why this helps
-    --------------
-    LoRa links are much happier when we send fewer bytes.
-    Compression reduces the size before chunking.
+    Returns
+    -------
+    encoded_text, raw_len, compressed_len, encoded_len
     """
     raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-    compressed = zlib.compress(raw, level=9)
-    return base64.b64encode(compressed).decode("utf-8")
-
-
-def packet_to_base64_with_stats(packet: dict[str, Any]) -> tuple[str, int, int]:
-    """
-    Same as packet_to_base64(), but also return:
-    - original JSON byte length
-    - compressed byte length
-
-    This is useful for debugging how much compression helps.
-    """
-    raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-    compressed = zlib.compress(raw, level=9)
+    compressed = zlib.compress(raw, level=COMPRESSION_LEVEL)
     encoded = base64.b64encode(compressed).decode("utf-8")
-    return encoded, len(raw), len(compressed)
+    return encoded, len(raw), len(compressed), len(encoded)
 
 
 def split_chunks(text: str, chunk_size: int) -> list[str]:
@@ -194,11 +157,6 @@ def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     Framing format
     --------------
     FRAME_START + JSON_BYTES + FRAME_END
-
-    Why we do this
-    --------------
-    This gives the receiver hard packet boundaries even if the LoRa serial
-    stream gets noisy or packets are merged together.
     """
     payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
     wire = FRAME_START + payload + FRAME_END
@@ -206,13 +164,13 @@ def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     ser.flush()
 
 
-def send_chunk_packets(ser: serial.Serial, packets: list[dict[str, Any]]) -> None:
+def send_chunk_packets(
+    ser: serial.Serial,
+    packets: list[dict[str, Any]],
+    delay_seconds: float,
+) -> None:
     """
-    Send a whole set of transport chunks with a small delay between each one.
-
-    Why the delay exists
-    --------------------
-    LoRa modules do better when we do not flood them back-to-back.
+    Send a whole set of transport chunks with a delay between each one.
     """
     total = len(packets)
     for idx, pkt in enumerate(packets):
@@ -222,7 +180,7 @@ def send_chunk_packets(ser: serial.Serial, packets: list[dict[str, Any]]) -> Non
                 f"[SAT][CHUNK] t={pkt['t']} sid={pkt['sid']} "
                 f"mid={pkt.get('mid')} idx={idx + 1}/{total}"
             )
-        time.sleep(CHUNK_DELAY_SECONDS)
+        time.sleep(delay_seconds)
 
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
@@ -236,21 +194,29 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     while True:
         start = buffer.find(FRAME_START)
         if start == -1:
-            # No valid frame start at all. Drop garbage and stop.
             buffer.clear()
             break
 
-        # Drop garbage before the next frame start.
         if start > 0:
             del buffer[:start]
 
         end = buffer.find(FRAME_END, 1)
         if end == -1:
-            # Frame not complete yet. Wait for more bytes.
+            if len(buffer) > MAX_CONTROL_FRAME_JSON_BYTES + 2:
+                del buffer[0]
             break
 
         frame = bytes(buffer[1:end])
         del buffer[:end + 1]
+
+        if not frame:
+            continue
+
+        if len(frame) > MAX_CONTROL_FRAME_JSON_BYTES:
+            if DEBUG_BAD_FRAMES:
+                print(f"[SAT] WARN: oversized control frame dropped ({len(frame)} bytes)")
+            continue
+
         frames.append(frame)
 
     return frames
@@ -259,11 +225,6 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
 def read_control_packet(ser: serial.Serial, timeout_seconds: float) -> dict[str, Any] | None:
     """
     Wait briefly for one framed ACK/NACK control packet.
-
-    Returns
-    -------
-    dict | None
-        Parsed ACK/NACK packet, or None if nothing valid arrives in time.
     """
     end_time = time.time() + timeout_seconds
     rx_buffer = bytearray()
@@ -282,10 +243,14 @@ def read_control_packet(ser: serial.Serial, timeout_seconds: float) -> dict[str,
 
         for frame_bytes in frames:
             try:
-                text = frame_bytes.decode("utf-8", errors="ignore").strip()
+                text = frame_bytes.decode("utf-8").strip()
                 if not text:
                     continue
                 pkt = json.loads(text)
+            except UnicodeDecodeError:
+                if DEBUG_BAD_FRAMES:
+                    print(f"[SAT] WARN: non-UTF8 control frame dropped: {frame_bytes[:80]!r}")
+                continue
             except json.JSONDecodeError:
                 if DEBUG_BAD_FRAMES:
                     print(f"[SAT] WARN: invalid control frame: {frame_bytes[:80]!r}")
@@ -302,6 +267,7 @@ def wait_for_ack_or_nack(
     session_id: str,
     message_id: int | None,
     pending_chunks: list[dict[str, Any]],
+    resend_delay_seconds: float,
 ) -> bool:
     """
     Wait for ACK/NACK and handle retransmission.
@@ -322,7 +288,7 @@ def wait_for_ack_or_nack(
                     f"[SAT][ACK] timeout sid={session_id} mid={message_id} "
                     f"attempt={attempt}/{MAX_RETRIES}"
                 )
-            send_chunk_packets(ser, pending_chunks)
+            send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
             continue
 
         if control.get("sid") != session_id:
@@ -346,7 +312,7 @@ def wait_for_ack_or_nack(
                         f"[SAT][NACK] session_init sid={session_id} "
                         f"attempt={attempt}/{MAX_RETRIES} -> resend all chunks"
                     )
-                send_chunk_packets(ser, pending_chunks)
+                send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
                 continue
 
             # telemetry: resend only missing indexes
@@ -361,7 +327,7 @@ def wait_for_ack_or_nack(
             if not resend:
                 resend = pending_chunks
 
-            send_chunk_packets(ser, resend)
+            send_chunk_packets(ser, resend, resend_delay_seconds)
             continue
 
     return False
@@ -436,27 +402,31 @@ session_init_packet = {
 }
 
 # Step 4: Compress + base64 encode for chunking
-session_init_b64, session_init_raw_len, session_init_comp_len = packet_to_base64_with_stats(
-    session_init_packet
+(
+    session_init_b64,
+    session_init_raw_len,
+    session_init_comp_len,
+    session_init_enc_len,
+) = packet_to_base64_with_stats(session_init_packet)
+
+# Step 5: Split into RF-safe chunks with control-plane tuning
+session_init_chunks = make_chunk_packets(
+    chunk_type="si",
+    session_id=session.session_id,
+    encoded_payload=session_init_b64,
+    chunk_size=SESSION_INIT_CHUNK_SIZE,
+    message_id=None,
 )
 
 if DEBUG_PACKET_SIZES:
     print(
         f"[SAT] session_init sizes raw={session_init_raw_len} "
-        f"compressed={session_init_comp_len}"
+        f"compressed={session_init_comp_len} encoded={session_init_enc_len} "
+        f"chunks={len(session_init_chunks)} chunk_size={SESSION_INIT_CHUNK_SIZE}"
     )
 
-# Step 5: Split into RF-safe chunks
-session_init_chunks = make_chunk_packets(
-    chunk_type="si",
-    session_id=session.session_id,
-    encoded_payload=session_init_b64,
-    chunk_size=CHUNK_SIZE,
-    message_id=None,
-)
-
 # Step 6: Send chunks
-send_chunk_packets(ser, session_init_chunks)
+send_chunk_packets(ser, session_init_chunks, SESSION_INIT_CHUNK_DELAY_SECONDS)
 
 print(
     f"[SAT] Sent session_init for session={session.session_id} "
@@ -469,6 +439,7 @@ session_init_ok = wait_for_ack_or_nack(
     session_id=session.session_id,
     message_id=None,
     pending_chunks=session_init_chunks,
+    resend_delay_seconds=SESSION_INIT_CHUNK_DELAY_SECONDS,
 )
 
 if not session_init_ok:
@@ -545,8 +516,8 @@ while True:
     # -------------------------------------------------------------
     # Step 7: Compress + base64 encode for chunking
     # -------------------------------------------------------------
-    telemetry_b64, telemetry_raw_len, telemetry_comp_len = packet_to_base64_with_stats(
-        transmitted_packet
+    telemetry_b64, telemetry_raw_len, telemetry_comp_len, telemetry_enc_len = (
+        packet_to_base64_with_stats(transmitted_packet)
     )
 
     # -------------------------------------------------------------
@@ -556,14 +527,14 @@ while True:
         chunk_type="tc",
         session_id=session.session_id,
         encoded_payload=telemetry_b64,
-        chunk_size=CHUNK_SIZE,
+        chunk_size=TELEMETRY_CHUNK_SIZE,
         message_id=sequence,
     )
 
     # -------------------------------------------------------------
     # Step 9: Send telemetry chunks
     # -------------------------------------------------------------
-    send_chunk_packets(ser, telemetry_chunks)
+    send_chunk_packets(ser, telemetry_chunks, TELEMETRY_CHUNK_DELAY_SECONDS)
 
     if DEBUG_PACKET_SIZES:
         print(
@@ -571,6 +542,7 @@ while True:
             f"session={session.session_id} seq={sequence} "
             f"chunks={len(telemetry_chunks)} "
             f"raw={telemetry_raw_len} compressed={telemetry_comp_len} "
+            f"encoded={telemetry_enc_len} chunk_size={TELEMETRY_CHUNK_SIZE} "
             f"payload={payload}"
         )
     else:
@@ -588,6 +560,7 @@ while True:
         session_id=session.session_id,
         message_id=sequence,
         pending_chunks=telemetry_chunks,
+        resend_delay_seconds=TELEMETRY_CHUNK_DELAY_SECONDS,
     )
 
     if not delivery_ok:
