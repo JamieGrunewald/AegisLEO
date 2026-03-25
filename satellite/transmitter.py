@@ -39,14 +39,14 @@ BAUD_RATE = 115200
 SPACECRAFT_ID = "AegisLEO-SAT-1"
 APID = 100
 
-SESSION_INIT_CHUNK_SIZE = 160
+SESSION_INIT_CHUNK_SIZE = 220
 TELEMETRY_CHUNK_SIZE = 180
 
-SESSION_INIT_CHUNK_DELAY_SECONDS = 0.30
+SESSION_INIT_CHUNK_DELAY_SECONDS = 0.35
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
 
-ACK_WAIT_SECONDS = 5.0
-MAX_RETRIES = 4
+ACK_WAIT_SECONDS = 15.0
+MAX_RETRIES = 6
 
 FRAME_START = b"\x7E"
 FRAME_END = b"\x7F"
@@ -224,7 +224,6 @@ def control_matches_session(control: dict[str, Any], session_id: str, message_id
 
     return control_mid == message_id
 
-
 def wait_for_ack_or_nack(
     ser: serial.Serial,
     session_id: str,
@@ -232,6 +231,87 @@ def wait_for_ack_or_nack(
     pending_chunks: list[dict[str, Any]],
     resend_delay_seconds: float,
 ) -> bool:
+    """
+    Wait for ACK/NACK with different behavior for:
+    - session_init (message_id is None): long-listen, low-chatter control recovery
+    - telemetry: normal timeout/retry behavior
+
+    Why this exists
+    ---------------
+    session_init is large and expensive. The receiver may take a while to decide
+    what is missing and emit a useful NACK. If we keep blasting the whole burst
+    too quickly, we can starve the reverse/control path.
+    """
+
+    # -------------------------------------------------------------
+    # SESSION INIT: listen-first mode
+    # -------------------------------------------------------------
+    if message_id is None:
+        # We allow more listen cycles than telemetry because the receiver may
+        # not send NACK until its stale timer fires.
+        session_listen_cycles = 10
+
+        for cycle in range(1, session_listen_cycles + 1):
+            control = read_control_packet(ser, ACK_WAIT_SECONDS)
+
+            if control is not None:
+                print(f"[SAT][CTRL RX] {control}")
+
+            if control is None:
+                if DEBUG_ACKS:
+                    print(
+                        f"[SAT][ACK] session_init quiet-listen timeout "
+                        f"sid={session_id} cycle={cycle}/{session_listen_cycles}"
+                    )
+
+                # Do NOT immediately re-blast the whole burst every cycle.
+                # Give the receiver more room to send control traffic.
+                #
+                # Only after every 3rd quiet cycle do we resend the full burst
+                # as a recovery nudge.
+                if cycle % 3 == 0:
+                    if DEBUG_ACKS:
+                        print("[SAT] session_init resend-all after extended quiet window")
+                    time.sleep(1.5)
+                    send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
+                    time.sleep(1.5)
+
+                continue
+
+            if not control_matches_session(control, session_id, message_id):
+                if DEBUG_ACKS:
+                    print(
+                        f"[SAT][CTRL RX] ignoring control for sid={control.get('sid')} "
+                        f"mid={control.get('mid')}"
+                    )
+                continue
+
+            control_type = control.get("t")
+
+            if control_type == "ack":
+                if DEBUG_ACKS:
+                    print(f"[SAT][ACK] received sid={session_id} mid={message_id}")
+                return True
+
+            if control_type == "nack":
+                missing = control.get("m", [])
+                if DEBUG_ACKS:
+                    print(
+                        f"[SAT][NACK] sid={session_id} mid={message_id} "
+                        f"missing={missing} cycle={cycle}/{session_listen_cycles}"
+                    )
+
+                # Small pause before selective resend so we do not stomp on the link.
+                time.sleep(0.5)
+                resend_missing_chunks(ser, pending_chunks, missing, resend_delay_seconds)
+                time.sleep(1.5)
+                continue
+
+        return False
+
+    # -------------------------------------------------------------
+    # TELEMETRY: standard retry mode
+    # -------------------------------------------------------------
     for attempt in range(1, MAX_RETRIES + 1):
         control = read_control_packet(ser, ACK_WAIT_SECONDS)
 
@@ -280,7 +360,6 @@ def wait_for_ack_or_nack(
             continue
 
     return False
-
 
 with open(SATELLITE_MLDSA_SECRET_KEY_PATH, "rb") as f:
     MLDSA_SECRET_KEY = f.read()
