@@ -4,7 +4,7 @@ Chunked RF Version with ACK/NACK Retransmission
 
 Created by: Jamie Grunewald
 Date: 2026-03-24
-Version: v0.8.0
+Version: v0.8.5
 
 Purpose
 -------
@@ -80,7 +80,7 @@ ACK_WAIT_SECONDS = 2.0
 MAX_RETRIES = 3
 
 # Debug controls
-DEBUG_TX_CHUNKS = True
+DEBUG_TX_CHUNKS =False
 DEBUG_ACKS = True
 
 
@@ -185,13 +185,15 @@ def send_chunk_packets(ser: serial.Serial, packets: list[dict[str, Any]]) -> Non
 
 def read_transport_line(ser: serial.Serial, timeout_seconds: float) -> dict[str, Any] | None:
     """
-    Wait briefly for one incoming transport packet from the receiver.
+    Wait briefly for one incoming transport control packet from the receiver.
 
-    Used for:
-    - ACK packets
-    - NACK packets
+    This function is intentionally defensive because the LoRa serial bridge
+    can occasionally hand us:
+    - non-UTF8 bytes
+    - partial junk
+    - lines that are not valid JSON
 
-    Returns None if nothing valid arrives before timeout.
+    We ignore anything that is not a clean JSON line.
     """
     end_time = time.time() + timeout_seconds
 
@@ -200,15 +202,25 @@ def read_transport_line(ser: serial.Serial, timeout_seconds: float) -> dict[str,
         if not ready:
             continue
 
-        line = ser.readline()
-        if not line:
+        raw = ser.readline()
+        if not raw:
+            continue
+
+        # Decode defensively so one bad byte does not crash the transmitter.
+        text = raw.decode("utf-8", errors="ignore").strip()
+
+        # Ignore empty lines or obvious non-JSON lines.
+        if not text or not text.startswith("{") or not text.endswith("}"):
             continue
 
         try:
-            return json.loads(line.decode("utf-8").strip())
+            pkt = json.loads(text)
         except json.JSONDecodeError:
-            # Ignore malformed control-plane input
             continue
+
+        # Only return recognized control-plane messages.
+        if pkt.get("t") in {"ack", "nack"}:
+            return pkt
 
     return None
 
@@ -220,18 +232,15 @@ def wait_for_ack_or_nack(
     pending_chunks: list[dict[str, Any]],
 ) -> bool:
     """
-    Wait for ACK/NACK and handle selective retransmission.
+    Wait for ACK/NACK and handle retransmission.
 
-    Returns
-    -------
-    bool
-        True if ACK received.
-        False if delivery failed after retries.
-
-    Behavior
-    --------
-    - session_init does not use a message ID, so it is matched with mid=None
-    - telemetry uses the sequence number as message ID
+    Policy
+    ------
+    - session_init (message_id is None):
+        retry the WHOLE message on timeout
+        ignore NACK-based selective retransmit
+    - telemetry (message_id is an int):
+        allow selective retransmission using bounded NACK lists
     """
     for attempt in range(1, MAX_RETRIES + 1):
         control = read_transport_line(ser, ACK_WAIT_SECONDS)
@@ -242,7 +251,6 @@ def wait_for_ack_or_nack(
                     f"[SAT][ACK] timeout sid={session_id} mid={message_id} "
                     f"attempt={attempt}/{MAX_RETRIES}"
                 )
-            # Timeout: retransmit whole message set
             send_chunk_packets(ser, pending_chunks)
             continue
 
@@ -260,7 +268,17 @@ def wait_for_ack_or_nack(
             return True
 
         if control_type == "nack":
-            missing = control.get("missing", [])
+            # For session_init, ignore selective NACK and just resend all on next loop
+            if message_id is None:
+                if DEBUG_ACKS:
+                    print(
+                        f"[SAT][NACK] session_init sid={session_id} "
+                        f"attempt={attempt}/{MAX_RETRIES} -> resend all chunks"
+                    )
+                send_chunk_packets(ser, pending_chunks)
+                continue
+
+            missing = control.get("m", [])
             if DEBUG_ACKS:
                 print(
                     f"[SAT][NACK] sid={session_id} mid={message_id} "
@@ -269,8 +287,8 @@ def wait_for_ack_or_nack(
 
             resend = [pkt for pkt in pending_chunks if pkt["i"] in missing]
             if not resend:
-                # If missing list is weird/empty, fall back to full resend
                 resend = pending_chunks
+
             send_chunk_packets(ser, resend)
             continue
 

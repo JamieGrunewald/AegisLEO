@@ -164,6 +164,11 @@ def pretty_time(epoch: int) -> str:
 def send_ack(session_id: str, message_id: int | None) -> None:
     """
     Tell the transmitter that a full logical packet was successfully reassembled.
+
+    Compact control packet:
+    t = ack
+    sid = session ID
+    mid = message ID (telemetry only)
     """
     pkt: dict[str, Any] = {"t": "ack", "sid": session_id}
     if message_id is not None:
@@ -180,8 +185,25 @@ def send_ack(session_id: str, message_id: int | None) -> None:
 def send_nack(session_id: str, message_id: int | None, missing: list[int]) -> None:
     """
     Tell the transmitter which chunk indexes are missing.
+
+    IMPORTANT:
+    We keep NACKs small by sending only the first small batch of missing indexes.
+    That prevents the NACK itself from becoming larger than the link can handle.
+
+    Compact control packet:
+    t = nack
+    sid = session ID
+    mid = telemetry message ID
+    m = compact missing list
     """
-    pkt: dict[str, Any] = {"t": "nack", "sid": session_id, "missing": missing}
+    MAX_MISSING_PER_NACK = 16
+    compact_missing = missing[:MAX_MISSING_PER_NACK]
+
+    pkt: dict[str, Any] = {
+        "t": "nack",
+        "sid": session_id,
+        "m": compact_missing,
+    }
     if message_id is not None:
         pkt["mid"] = message_id
 
@@ -190,14 +212,19 @@ def send_nack(session_id: str, message_id: int | None, missing: list[int]) -> No
     ser.flush()
 
     if DEBUG_ACKS:
-        print(f"[GROUND][NACK] sid={session_id} mid={message_id} missing={missing}")
-
-
+        print(f"[GROUND][NACK] sid={session_id} mid={message_id} missing={compact_missing}")
+        
+        
 def cleanup_reassembly_buffers() -> None:
     """
     Remove stale incomplete chunk sets.
 
-    Before deleting them, send a NACK listing missing chunk indexes.
+    Policy
+    ------
+    - session_init (mid is None): do NOT send NACK, because the missing list can
+      become enormous. Let the transmitter retry the whole message on timeout.
+    - telemetry (mid is an int): send a compact NACK with a small batch of
+      missing chunk indexes.
     """
     now = time.time()
     stale_keys: list[tuple[str, str, int | None]] = []
@@ -212,14 +239,23 @@ def cleanup_reassembly_buffers() -> None:
         buf = reassembly_buffers[key]
         missing = buf.missing_indexes()
 
-        # Ask sender to retransmit missing chunks
+        # session_init: let transmitter timeout and resend all
+        if message_id is None:
+            if DEBUG_ACKS:
+                print(
+                    f"[GROUND][INFO] stale session_init sid={session_id} "
+                    f"missing_count={len(missing)} -> waiting for full resend"
+                )
+            del reassembly_buffers[key]
+            continue
+
+        # telemetry: send compact NACK and keep received parts
         send_nack(session_id, message_id, missing)
 
-        # Reset timer by replacing buffer with a fresh holder that preserves parts
+        # Reset timer while preserving already received chunks
         new_buf = ChunkAssembly(total_chunks=buf.total_chunks)
         new_buf.parts = dict(buf.parts)
         reassembly_buffers[key] = new_buf
-
 
 def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
     """
@@ -274,29 +310,32 @@ def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------
 while True:
     try:
-        # Read one transport chunk packet per line.
+        # Read exactly one transport packet line.
         line = ser.readline()
 
         if not line:
             cleanup_reassembly_buffers()
             continue
 
-        try:
-            transport_packet = json.loads(line.decode("utf-8").strip())
-        except json.JSONDecodeError:
-            print(f"[GROUND] WARN: invalid JSON line: {line[:80]!r}")
+        # Decode defensively. Bad bytes should not crash the receiver.
+        text = line.decode("utf-8", errors="ignore").strip()
+
+        if not text or not text.startswith("{") or not text.endswith("}"):
             continue
 
-        # Ignore control packets from the other side if they show up here.
+        try:
+            transport_packet = json.loads(text)
+        except json.JSONDecodeError:
+            print(f"[GROUND] WARN: invalid JSON line: {text[:80]!r}")
+            continue
+
+        # Ignore control packets if they loop back or appear on the RX side.
         if transport_packet.get("t") in {"ack", "nack"}:
             continue
 
-        # -------------------------------------------------------------
-        # Step 1: Reassemble transport chunks into full logical packet
-        # -------------------------------------------------------------
+        # Reassemble transport chunks into full logical packet
         packet = add_transport_chunk(transport_packet)
 
-        # If not complete yet, wait for more chunks
         if packet is None:
             continue
 
