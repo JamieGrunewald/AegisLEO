@@ -168,42 +168,63 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     return frames
 
 
-def read_control_packet(ser: serial.Serial, timeout_seconds: float) -> dict[str, Any] | None:
-    end_time = time.time() + timeout_seconds
-    rx_buffer = bytearray()
+def read_control_packet(ser: serial.Serial, timeout: float) -> dict | None:
+    """
+    Read one length-prefixed control packet.
 
-    while time.time() < end_time:
-        ready, _, _ = select.select([ser.fileno()], [], [], 0.2)
-        if not ready:
+    Frame format:
+    [START][LEN][JSON][END]
+    """
+
+    buffer = bytearray()
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        chunk = ser.read(512)
+        if chunk:
+            buffer.extend(chunk)
+
+        # Need at least START + LEN
+        if len(buffer) < 1 + 4:
             continue
 
-        raw = ser.read(512)
-        if not raw:
+        start = buffer.find(FRAME_START)
+        if start == -1:
+            buffer.clear()
             continue
 
-        rx_buffer.extend(raw)
-        frames = extract_framed_packets(rx_buffer)
+        if start > 0:
+            del buffer[:start]
 
-        for frame_bytes in frames:
-            try:
-                text = frame_bytes.decode("utf-8").strip()
-                if not text:
-                    continue
-                pkt = json.loads(text)
-            except UnicodeDecodeError:
-                if DEBUG_BAD_FRAMES:
-                    print(f"[SAT] WARN: non-UTF8 control frame dropped: {frame_bytes[:80]!r}")
-                continue
-            except json.JSONDecodeError:
-                if DEBUG_BAD_FRAMES:
-                    print(f"[SAT] WARN: invalid control frame: {frame_bytes[:80]!r}")
-                continue
+        if len(buffer) < 1 + 4:
+            continue
 
-            if pkt.get("t") in {"ack", "nack"}:
-                return pkt
+        payload_len = int.from_bytes(buffer[1:5], "big")
+
+        if payload_len <= 0 or payload_len > 4096:
+            del buffer[0]
+            continue
+
+        full_len = 1 + 4 + payload_len + 1
+
+        if len(buffer) < full_len:
+            continue
+
+        payload = buffer[5:5 + payload_len]
+        end_marker = buffer[5 + payload_len:5 + payload_len + 1]
+
+        if end_marker != FRAME_END:
+            del buffer[0]
+            continue
+
+        del buffer[:full_len]
+
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except Exception:
+            continue
 
     return None
-
 
 def resend_missing_chunks(
     ser: serial.Serial,
