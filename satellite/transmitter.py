@@ -3,7 +3,6 @@ AegisLEO Secure Satellite Telemetry Transmitter
 Transport-Hardened RF Version with Selective session_init Recovery
 
 Created by: Jamie Grunewald
-Updated by: OpenAI ChatGPT
 Date: 2026-03-25
 Version: v0.11.4
 
@@ -110,7 +109,11 @@ def make_chunk_packets(
 
 def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
-    wire = FRAME_START + payload + FRAME_END
+    
+    #wire = FRAME_START + payload + FRAME_END
+    
+    length = len(payload).to_bytes(4, "big")
+    wire = FRAME_START + length + payload + FRAME_END
     ser.write(wire)
     ser.flush()
     time.sleep(0.02)
