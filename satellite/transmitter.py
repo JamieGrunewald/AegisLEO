@@ -1,9 +1,9 @@
 """
-AegisLEO Secure Satellite Telemetry Transmitter
+AegisLEO Secure Satellite Telemetry Transmitter (Chunked RF Version)
 
 Created by: Jamie Grunewald
 Date: 2026-03-24
-Version: v0.6.2
+Version: v0.7.0
 
 Purpose
 -------
@@ -12,41 +12,48 @@ to the ground station over the LoRa serial link.
 
 What this transmitter does
 --------------------------
-For every packet it sends, it will:
+For every telemetry update, it will:
 
 1. Load the ground station's ML-KEM public key
 2. Create a PQ session and derive an AES-256 session key
-3. Create simulated telemetry values
-4. Build a CCSDS-inspired telemetry frame
-5. Convert that frame into deterministic JSON bytes
-6. Encrypt the frame using the session AES key
-7. Build an outer packet envelope with KEM metadata
-8. Sign the encrypted envelope using ML-DSA
-9. Send the final JSON packet over serial
+3. Build a signed session_init packet
+4. Chunk that packet into small RF-safe transport chunks
+5. Send session_init chunks once
+6. Build encrypted + signed telemetry packets
+7. Chunk telemetry packets into small RF-safe transport chunks
+8. Send those chunks over serial/LoRa
 
-Why this matters
-----------------
-This gives the transmitter a layered security flow:
+Why chunking exists
+-------------------
+LoRa transparent serial bridges are not great at carrying large JSON blobs.
+So instead of sending one giant packet, we:
 
-- CCSDS-style frame gives structure to telemetry
-- ML-KEM establishes a shared session key dynamically
-- AES-GCM protects confidentiality and integrity
-- ML-DSA proves the packet came from the expected sender
+- serialize the full logical packet
+- base64-encode it
+- split it into small chunks
+- send one chunk per line of JSON
 
-Important note
---------------
-This version replaces the old hardcoded AES key with a session key
-derived from ML-KEM via key_manager.py.
+The receiver reassembles the pieces.
+
+Security note
+-------------
+This version keeps:
+- ML-KEM for session establishment
+- AES-GCM for telemetry confidentiality + integrity
+- ML-DSA signatures on the full logical packets
+
+So we are not throwing security away.
+We are only changing the transport format.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import random
 import time
 
 import serial
-from datetime import datetime, timezone
 
 from ccsds.frame import build_frame, canonical_json_bytes
 from crypto.aes_gcm import encrypt
@@ -63,32 +70,106 @@ BAUD_RATE = 115200
 SPACECRAFT_ID = "AegisLEO-SAT-1"
 APID = 100
 
+# Small chunk size for RF safety.
+# You can tune this later if needed.
+CHUNK_SIZE = 80
+
+# Small pause between chunk transmissions so we do not overwhelm the radio.
+CHUNK_DELAY_SECONDS = 0.05
+
 
 # ---------------------------------------------------------------------
 # Crypto / key file settings
 # ---------------------------------------------------------------------
 MLDSA_ALGORITHM = "ML-DSA-65"
 
-# Satellite private signing key
 SATELLITE_MLDSA_SECRET_KEY_PATH = "keys/satellite_mldsa_secret.key"
-
-# Ground station public KEM key
 RECEIVER_KEM_PUBLIC_KEY_PATH = "dev_secrets/satellite/receiver_kem_public.key"
 
 
 # ---------------------------------------------------------------------
-# Load the satellite private signing key
+# Helper functions
+# ---------------------------------------------------------------------
+def packet_to_base64(packet: dict) -> str:
+    """
+    Convert a full logical packet into compact JSON bytes, then base64 text.
+
+    Why we do this
+    --------------
+    The full packet may contain lots of characters that are awkward to split
+    directly inside another JSON wrapper.
+
+    Base64 gives us a safe ASCII payload made of simple characters.
+    """
+    raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("utf-8")
+
+
+def split_chunks(text: str, chunk_size: int) -> list[str]:
+    """
+    Split a string into fixed-size chunks.
+    """
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+def make_chunk_packets(
+    chunk_type: str,
+    session_id: str,
+    encoded_payload: str,
+    chunk_size: int,
+    message_id: int | None = None,
+) -> list[dict]:
+    """
+    Wrap a long base64 payload in small transport chunks.
+
+    Chunk packet format
+    -------------------
+    t   -> transport type
+    sid -> session ID
+    mid -> message ID (telemetry only)
+    i   -> chunk index
+    n   -> total number of chunks
+    d   -> data fragment
+    """
+    fragments = split_chunks(encoded_payload, chunk_size)
+    total = len(fragments)
+
+    packets: list[dict] = []
+    for idx, frag in enumerate(fragments):
+        pkt = {
+            "t": chunk_type,
+            "sid": session_id,
+            "i": idx,
+            "n": total,
+            "d": frag,
+        }
+        if message_id is not None:
+            pkt["mid"] = message_id
+        packets.append(pkt)
+
+    return packets
+
+
+def send_chunk_packets(ser: serial.Serial, packets: list[dict]) -> None:
+    """
+    Send chunk packets one line at a time.
+
+    Each chunk packet is small and newline-delimited so the receiver can
+    consume one transport chunk at a time.
+    """
+    for pkt in packets:
+        wire_bytes = (json.dumps(pkt, separators=(",", ":")) + "\n").encode("utf-8")
+        ser.write(wire_bytes)
+        ser.flush()
+        time.sleep(CHUNK_DELAY_SECONDS)
+
+
+# ---------------------------------------------------------------------
+# Load key material
 # ---------------------------------------------------------------------
 with open(SATELLITE_MLDSA_SECRET_KEY_PATH, "rb") as f:
     MLDSA_SECRET_KEY = f.read()
 
-
-# ---------------------------------------------------------------------
-# Load the ground station KEM public key
-# ---------------------------------------------------------------------
-# This public key is safe to place on the satellite side.
-# It lets the satellite encapsulate a shared secret that only the
-# ground station can decapsulate with its private key.
 with open(RECEIVER_KEM_PUBLIC_KEY_PATH, "rb") as f:
     RECEIVER_KEM_PUBLIC_KEY = f.read()
 
@@ -96,10 +177,6 @@ with open(RECEIVER_KEM_PUBLIC_KEY_PATH, "rb") as f:
 # ---------------------------------------------------------------------
 # Create PQ session at startup
 # ---------------------------------------------------------------------
-# The transmitter acts as the initiator:
-# - it uses the receiver public key
-# - it gets back a session object and a KEM ciphertext
-# - the session contains the AES key we will use for encryption
 key_manager = KeyManager()
 
 initiator_handshake = key_manager.create_initiator_session(
@@ -130,39 +207,56 @@ print(f"Session ID : {session.session_id}")
 print(f"KEM alg    : {key_manager.algorithm}")
 print("Press Ctrl+C to stop.")
 
-# -------------------------------------------------------------
-# Send session initialization packet ONCE
-# -------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# Send session_init once
+# ---------------------------------------------------------------------
+# Step 1: Build the unsigned session_init core
 session_init_core = {
     "type": "session_init",
     "spacecraft_id": SPACECRAFT_ID,
     "session_id": session.session_id,
-    "kem_ciphertext": "TEST"
-    #"kem_ciphertext": b64e(kem_ciphertext),
+    "kem_ciphertext": b64e(kem_ciphertext),
 }
 
-session_init_bytes = canonical_json_bytes(session_init_core)
-
+# Step 2: Sign the session_init core
 session_init_signature = sign(
-    session_init_bytes,
+    canonical_json_bytes(session_init_core),
     MLDSA_SECRET_KEY,
     algorithm=MLDSA_ALGORITHM,
 )
 
+# Step 3: Build the final logical session_init packet
 session_init_packet = {
     **session_init_core,
     "signature": b64e(session_init_signature),
 }
 
-ser.write((json.dumps(session_init_packet) + "\n").encode("utf-8"))
-ser.flush()
+# Step 4: Convert the full logical packet to base64 text
+session_init_b64 = packet_to_base64(session_init_packet)
 
-print(f"[SAT] Sent session_init for session={session.session_id}")
+# Step 5: Split into small RF-safe transport chunks
+session_init_chunks = make_chunk_packets(
+    chunk_type="si",              # session_init transport chunk
+    session_id=session.session_id,
+    encoded_payload=session_init_b64,
+    chunk_size=CHUNK_SIZE,
+)
 
+# Step 6: Send all chunks
+send_chunk_packets(ser, session_init_chunks)
+
+print(
+    f"[SAT] Sent session_init for session={session.session_id} "
+    f"({len(session_init_chunks)} chunks)"
+)
+
+# Small pause so the receiver has time to establish the session.
 time.sleep(1)
 
+
 # ---------------------------------------------------------------------
-# Main transmit loop
+# Main telemetry loop
 # ---------------------------------------------------------------------
 while True:
     # -------------------------------------------------------------
@@ -186,12 +280,12 @@ while True:
     )
 
     # -------------------------------------------------------------
-    # Step 3: Convert the frame into deterministic JSON bytes
+    # Step 3: Convert frame into deterministic bytes
     # -------------------------------------------------------------
     frame_bytes = canonical_json_bytes(frame)
 
     # -------------------------------------------------------------
-    # Step 4: Encrypt the telemetry frame with the session AES key
+    # Step 4: Encrypt the telemetry frame with AES-GCM
     # -------------------------------------------------------------
     encrypted = encrypt(
         frame_bytes,
@@ -200,64 +294,62 @@ while True:
     )
 
     # -------------------------------------------------------------
-    # Step 5: Build the packet core
+    # Step 5: Build the unsigned telemetry packet core
     # -------------------------------------------------------------
-    # This is the signed envelope that travels over the wire.
-    # It now includes:
-    # - session_id
-    # - KEM algorithm
-    # - KEM ciphertext
-    #
-    # For this bring-up phase, we include kem_ciphertext on every packet
-    # to keep the receiver logic simple and robust.
     packet_core = {
         "type": "telemetry",
+        "spacecraft_id": SPACECRAFT_ID,
         "session_id": session.session_id,
         "nonce": b64e(encrypted["nonce"]),
         "ciphertext": b64e(encrypted["ciphertext"]),
     }
 
     # -------------------------------------------------------------
-    # Step 6: Sign the encrypted packet core with ML-DSA
+    # Step 6: Sign the telemetry packet core
     # -------------------------------------------------------------
-    packet_core_bytes = canonical_json_bytes(packet_core)
-
-    signature = sign(
-        packet_core_bytes,
+    telemetry_signature = sign(
+        canonical_json_bytes(packet_core),
         MLDSA_SECRET_KEY,
         algorithm=MLDSA_ALGORITHM,
     )
 
     # -------------------------------------------------------------
-    # Step 7: Build the final transmitted packet
+    # Step 7: Build the final logical telemetry packet
     # -------------------------------------------------------------
     transmitted_packet = {
         **packet_core,
-        "signature": b64e(signature),
+        "signature": b64e(telemetry_signature),
     }
 
     # -------------------------------------------------------------
-    # Step 8: Convert packet to newline-delimited JSON
+    # Step 8: Convert logical telemetry packet to base64 text
     # -------------------------------------------------------------
-    wire_bytes = (json.dumps(transmitted_packet) + "\n").encode("utf-8")
+    telemetry_b64 = packet_to_base64(transmitted_packet)
 
     # -------------------------------------------------------------
-    # Step 9: Send the packet over the serial link
+    # Step 9: Split telemetry into RF-safe chunks
     # -------------------------------------------------------------
-    ser.write(wire_bytes)
-    ser.flush()
-
-    print(
-        f"[SAT] TX secure packet "
-        f"session={session.session_id} seq={sequence} payload={payload}"
+    telemetry_chunks = make_chunk_packets(
+        chunk_type="tc",              # telemetry transport chunk
+        session_id=session.session_id,
+        encoded_payload=telemetry_b64,
+        chunk_size=CHUNK_SIZE,
+        message_id=sequence,          # helps receiver group chunk sets
     )
 
     # -------------------------------------------------------------
-    # Step 10: Increment sequence number
+    # Step 10: Send telemetry chunks
     # -------------------------------------------------------------
-    sequence += 1
+    send_chunk_packets(ser, telemetry_chunks)
+
+    print(
+        f"[SAT] TX secure packet "
+        f"session={session.session_id} seq={sequence} "
+        f"chunks={len(telemetry_chunks)} payload={payload}"
+    )
 
     # -------------------------------------------------------------
-    # Step 11: Wait before sending the next packet
+    # Step 11: Increment packet sequence number and wait
     # -------------------------------------------------------------
+    sequence += 1
     time.sleep(3)

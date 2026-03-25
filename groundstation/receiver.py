@@ -1,43 +1,53 @@
 """
-AegisLEO Ground Station Secure Receiver
+AegisLEO Ground Station Secure Receiver (Chunked RF Version)
 
 Created by: Jamie Grunewald
 Date: 2026-03-24
-Version: v0.6.2
+Version: v0.7.0
 
 Purpose
 -------
 This script runs on the ground station and listens for incoming
 secure telemetry packets from the satellite node.
 
-Protocol
---------
-This receiver supports a two-phase protocol:
-
-1. session_init
-   - sent once by the satellite
-   - contains session_id + kem_ciphertext
-   - receiver derives and stores the session AES key
-
-2. telemetry
-   - sent repeatedly after session_init
-   - contains session_id + nonce + ciphertext
-   - receiver decrypts using the stored session AES key
+What this receiver does
+-----------------------
+1. Read small transport chunks from the LoRa serial bridge
+2. Reassemble those chunks into full logical packets
+3. Handle a signed session_init packet
+4. Handle signed, encrypted telemetry packets
+5. Decrypt telemetry using the established session AES key
+6. Parse telemetry frame
+7. Apply replay protection
+8. Run anomaly detection
+9. Print a clean operator view
 
 Why this version matters
 ------------------------
-LoRa serial bridges do not always preserve newline or packet boundaries.
-So this receiver uses a rolling text buffer and incremental JSON decoding
-to reconstruct complete JSON objects from partial serial chunks.
+LoRa transparent serial links do not reliably carry large JSON packets as
+single units. So this receiver reconstructs them from smaller RF-safe chunks.
 
-This version also adds temporary debug output so we can see:
-- raw chunks arriving from serial
-- whether the buffer is growing but never forming valid JSON
+Transport chunk types
+---------------------
+si -> session_init chunk
+tc -> telemetry chunk
+
+Important note
+--------------
+The security model is preserved at the logical-packet layer:
+- session_init is still signed
+- telemetry is still signed
+- telemetry payload is still encrypted with AES-GCM
+
+Chunking only changes transport format, not core security intent.
 """
 
 from __future__ import annotations
 
+import base64
 import json
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import serial
@@ -61,9 +71,13 @@ MLDSA_ALGORITHM = "ML-DSA-65"
 SATELLITE_MLDSA_PUBLIC_KEY_PATH = "keys/satellite_mldsa_public.key"
 RECEIVER_KEM_PRIVATE_KEY_PATH = "dev_secrets/groundstation/receiver_kem_private.key"
 
-# Temporary debug controls
-DEBUG_SERIAL = True
-DEBUG_BUFFER = True
+# Debug controls
+DEBUG_SERIAL = False
+DEBUG_CHUNKS = False
+DEBUG_REASSEMBLY = False
+
+# Drop incomplete chunk sets after this many seconds
+REASSEMBLY_TTL_SECONDS = 30
 
 
 # ---------------------------------------------------------------------
@@ -77,6 +91,39 @@ with open(RECEIVER_KEM_PRIVATE_KEY_PATH, "rb") as f:
 
 
 # ---------------------------------------------------------------------
+# Reassembly helpers
+# ---------------------------------------------------------------------
+@dataclass
+class ChunkAssembly:
+    """
+    Hold the pieces of one logical packet while chunks arrive.
+    """
+    total_chunks: int
+    created_at: float = field(default_factory=time.time)
+    parts: dict[int, str] = field(default_factory=dict)
+
+    def add_part(self, idx: int, data: str) -> None:
+        self.parts[idx] = data
+
+    def is_complete(self) -> bool:
+        return len(self.parts) == self.total_chunks
+
+    def assemble(self) -> str:
+        """
+        Rebuild the original base64 payload in order.
+        """
+        return "".join(self.parts[i] for i in range(self.total_chunks))
+
+
+def b64text_to_packet(text: str) -> dict:
+    """
+    Convert the assembled base64 text back into the original logical packet.
+    """
+    raw = base64.b64decode(text.encode("utf-8"))
+    return json.loads(raw.decode("utf-8"))
+
+
+# ---------------------------------------------------------------------
 # Runtime objects
 # ---------------------------------------------------------------------
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
@@ -84,9 +131,16 @@ ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 key_manager = KeyManager()
 detector = RuntimeDetector()
 
+# sessions[session_id] -> SessionState
 sessions: dict[str, object] = {}
+
+# replay_windows[session_id] -> ReplayWindow
 replay_windows: dict[str, ReplayWindow] = {}
 
+# reassembly_buffers[(chunk_type, session_id, message_id)] -> ChunkAssembly
+reassembly_buffers: dict[tuple[str, str, int | None], ChunkAssembly] = {}
+
+# JSON decoder for small transport chunk packets
 decoder = json.JSONDecoder()
 
 print("Ground station secure receiver online")
@@ -108,13 +162,16 @@ def pretty_time(epoch: int) -> str:
 
 def extract_next_json(buffer: str) -> tuple[dict | None, str]:
     """
-    Attempt to extract one complete JSON object from a text buffer.
+    Try to peel one JSON object off the front/middle of a text buffer.
 
-    Returns
-    -------
-    tuple[dict | None, str]
-        - parsed JSON object if successful, else None
-        - remaining buffer
+    Why this exists
+    ---------------
+    The serial bridge may still hand us:
+    - one clean chunk packet
+    - multiple chunk packets at once
+    - leading junk before a '{'
+
+    So we find the first '{' and ask the JSON decoder to parse one object.
     """
     start = buffer.find("{")
     if start == -1:
@@ -127,7 +184,69 @@ def extract_next_json(buffer: str) -> tuple[dict | None, str]:
         remaining = candidate[end_idx:]
         return packet, remaining
     except json.JSONDecodeError:
+        # Not enough data yet for one complete transport chunk packet
         return None, candidate
+
+
+def cleanup_reassembly_buffers() -> None:
+    """
+    Remove stale incomplete chunk sets so memory does not grow forever.
+    """
+    now = time.time()
+    stale_keys = [
+        key for key, buf in reassembly_buffers.items()
+        if now - buf.created_at > REASSEMBLY_TTL_SECONDS
+    ]
+    for key in stale_keys:
+        del reassembly_buffers[key]
+
+
+def add_transport_chunk(packet: dict) -> dict | None:
+    """
+    Add one transport chunk packet to the appropriate reassembly bucket.
+
+    Returns
+    -------
+    dict | None
+        The full logical packet when all chunks are present, else None.
+    """
+    cleanup_reassembly_buffers()
+
+    chunk_type = packet["t"]
+    session_id = packet["sid"]
+    message_id = packet.get("mid")
+
+    chunk_index = int(packet["i"])
+    chunk_total = int(packet["n"])
+    data_fragment = packet["d"]
+
+    key = (chunk_type, session_id, message_id)
+
+    if key not in reassembly_buffers:
+        reassembly_buffers[key] = ChunkAssembly(total_chunks=chunk_total)
+
+    buf = reassembly_buffers[key]
+    buf.add_part(chunk_index, data_fragment)
+
+    if DEBUG_CHUNKS:
+        print(
+            f"[DEBUG] CHUNK t={chunk_type} sid={session_id} "
+            f"mid={message_id} idx={chunk_index}/{chunk_total - 1}"
+        )
+
+    if not buf.is_complete():
+        return None
+
+    assembled_b64 = buf.assemble()
+    del reassembly_buffers[key]
+
+    if DEBUG_REASSEMBLY:
+        print(
+            f"[DEBUG] REASSEMBLED t={chunk_type} sid={session_id} "
+            f"mid={message_id} len={len(assembled_b64)}"
+        )
+
+    return b64text_to_packet(assembled_b64)
 
 
 # ---------------------------------------------------------------------
@@ -136,6 +255,7 @@ def extract_next_json(buffer: str) -> tuple[dict | None, str]:
 buffer = ""
 
 while True:
+    # Read serial bytes and append to rolling text buffer.
     chunk = ser.read(1024)
 
     if not chunk:
@@ -146,20 +266,27 @@ while True:
 
     buffer += chunk.decode("utf-8", errors="ignore")
 
-    if DEBUG_BUFFER and len(buffer) > 300:
-        print(f"[DEBUG] BUFFER LEN: {len(buffer)}")
-
+    # Keep pulling out small transport chunk packets as they become available.
     while True:
-        packet, buffer = extract_next_json(buffer)
+        transport_packet, buffer = extract_next_json(buffer)
 
-        if packet is None:
+        if transport_packet is None:
             break
 
         try:
+            # ---------------------------------------------------------
+            # Step 1: Reassemble transport chunks into full logical packet
+            # ---------------------------------------------------------
+            packet = add_transport_chunk(transport_packet)
+
+            # If packet is None, we do not have all chunks yet.
+            if packet is None:
+                continue
+
             packet_type = packet.get("type")
 
             # ---------------------------------------------------------
-            # Step 1: Handle session_init packets
+            # Step 2: Handle session_init logical packet
             # ---------------------------------------------------------
             if packet_type == "session_init":
                 packet_core = {
@@ -201,10 +328,10 @@ while True:
                 continue
 
             # ---------------------------------------------------------
-            # Step 2: Handle telemetry packets
+            # Step 3: Handle telemetry logical packet
             # ---------------------------------------------------------
             if packet_type != "telemetry":
-                print(f"[GROUND] WARN: unknown packet type: {packet_type}")
+                print(f"[GROUND] WARN: unknown logical packet type: {packet_type}")
                 continue
 
             packet_core = {
@@ -240,23 +367,22 @@ while True:
                 continue
 
             # ---------------------------------------------------------
-            # Step 3: Decrypt telemetry payload
+            # Step 4: Decrypt telemetry payload
             # ---------------------------------------------------------
             plaintext = decrypt(
                 b64d(packet["nonce"]),
                 b64d(packet["ciphertext"]),
                 session.aes_key,
-                aad=b"AegisLEO-SAT-1"
-                #aad=packet["spacecraft_id"].encode("utf-8"),
+                aad=packet["spacecraft_id"].encode("utf-8"),
             )
 
             # ---------------------------------------------------------
-            # Step 4: Parse decrypted frame
+            # Step 5: Parse decrypted telemetry frame
             # ---------------------------------------------------------
             frame = parse_json_bytes(plaintext)
 
             # ---------------------------------------------------------
-            # Step 5: Replay protection
+            # Step 6: Replay protection
             # ---------------------------------------------------------
             sequence = int(frame["sequence"])
 
@@ -272,19 +398,19 @@ while True:
             replay_window.record(sequence)
 
             # ---------------------------------------------------------
-            # Step 6: Compute gap
+            # Step 7: Compute packet gap
             # ---------------------------------------------------------
             gap = 0
             if previous_max != -1 and sequence > previous_max + 1:
                 gap = sequence - previous_max - 1
 
             # ---------------------------------------------------------
-            # Step 7: Run anomaly detection
+            # Step 8: Run anomaly detection
             # ---------------------------------------------------------
             detection = detector.detect(frame)
 
             # ---------------------------------------------------------
-            # Step 8: Print operator view
+            # Step 9: Print clean operator view
             # ---------------------------------------------------------
             payload = frame["payload"]
 
