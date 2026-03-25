@@ -3,7 +3,7 @@ AegisLEO Secure Satellite Telemetry Transmitter
 
 Created by: Jamie Grunewald
 Date: 2026-03-24
-Version: v0.5.0
+Version: v0.6.1
 
 Purpose
 -------
@@ -46,6 +46,7 @@ import random
 import time
 
 import serial
+from datetime import datetime, timezone
 
 from ccsds.frame import build_frame, canonical_json_bytes
 from crypto.aes_gcm import encrypt
@@ -129,6 +130,35 @@ print(f"Session ID : {session.session_id}")
 print(f"KEM alg    : {key_manager.algorithm}")
 print("Press Ctrl+C to stop.")
 
+# -------------------------------------------------------------
+# Send session initialization packet ONCE
+# -------------------------------------------------------------
+session_init_core = {
+    "type": "session_init",
+    "spacecraft_id": SPACECRAFT_ID,
+    "session_id": session.session_id,
+    "kem_ciphertext": b64e(kem_ciphertext),
+}
+
+session_init_bytes = canonical_json_bytes(session_init_core)
+
+session_init_signature = sign(
+    session_init_bytes,
+    MLDSA_SECRET_KEY,
+    algorithm=MLDSA_ALGORITHM,
+)
+
+session_init_packet = {
+    **session_init_core,
+    "signature": b64e(session_init_signature),
+}
+
+ser.write((json.dumps(session_init_packet) + "\n").encode("utf-8"))
+ser.flush()
+
+print(f"[SAT] Sent session_init for session={session.session_id}")
+
+time.sleep(1)
 
 # ---------------------------------------------------------------------
 # Main transmit loop
@@ -180,14 +210,9 @@ while True:
     # For this bring-up phase, we include kem_ciphertext on every packet
     # to keep the receiver logic simple and robust.
     packet_core = {
+        "type": "telemetry",
         "spacecraft_id": SPACECRAFT_ID,
         "session_id": session.session_id,
-        "algorithms": {
-            "enc": "AES-256-GCM",
-            "sig": MLDSA_ALGORITHM,
-            "kem": key_manager.algorithm,
-        },
-        "kem_ciphertext": b64e(kem_ciphertext),
         "nonce": b64e(encrypted["nonce"]),
         "ciphertext": b64e(encrypted["ciphertext"]),
     }
