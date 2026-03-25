@@ -41,10 +41,10 @@ APID = 100
 SESSION_INIT_CHUNK_SIZE = 160
 TELEMETRY_CHUNK_SIZE = 180
 
-SESSION_INIT_CHUNK_DELAY_SECONDS = 0.18
+SESSION_INIT_CHUNK_DELAY_SECONDS = 0.25
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
 
-ACK_WAIT_SECONDS = 3.0
+ACK_WAIT_SECONDS = 5.0
 MAX_RETRIES = 4
 
 FRAME_START = b"\x7E"
@@ -88,15 +88,20 @@ def make_chunk_packets(
 
     packets: list[dict[str, Any]] = []
     for idx, frag in enumerate(fragments):
+        frag_crc = zlib.crc32(frag.encode("utf-8")) & 0xFFFFFFFF
+
         pkt: dict[str, Any] = {
             "t": chunk_type,
             "sid": session_id,
             "i": idx,
             "n": total,
             "d": frag,
+            "c": frag_crc,
         }
+
         if message_id is not None:
             pkt["mid"] = message_id
+
         packets.append(pkt)
 
     return packets
@@ -123,6 +128,7 @@ def send_chunk_packets(
                 f"mid={pkt.get('mid')} idx={idx + 1}/{total}"
             )
         time.sleep(delay_seconds)
+
 
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
@@ -236,6 +242,7 @@ def wait_for_ack_or_nack(
                     f"attempt={attempt}/{MAX_RETRIES}"
                 )
             send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
+            time.sleep(0.5)
             continue
 
         if not control_matches_session(control, session_id, message_id):
@@ -331,6 +338,8 @@ print(
     f"({len(session_init_chunks)} chunks)"
 )
 
+time.sleep(0.5)
+
 session_init_ok = wait_for_ack_or_nack(
     ser=ser,
     session_id=session.session_id,
@@ -411,6 +420,8 @@ while True:
             f"encoded={telemetry_enc_len} chunk_size={TELEMETRY_CHUNK_SIZE} "
             f"payload={payload}"
         )
+
+    time.sleep(0.5)
 
     delivery_ok = wait_for_ack_or_nack(
         ser=ser,

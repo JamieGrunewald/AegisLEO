@@ -200,7 +200,7 @@ def validate_transport_packet(packet: dict[str, Any]) -> bool:
     if packet_type in {"ack", "nack"}:
         return True
 
-    required = {"t", "sid", "i", "n", "d"}
+    required = {"t", "sid", "i", "n", "d", "c"}
     if not required.issubset(packet):
         if DEBUG_SCHEMA:
             print(f"[GROUND][SCHEMA] missing keys in transport packet: {packet}")
@@ -213,24 +213,30 @@ def validate_transport_packet(packet: dict[str, Any]) -> bool:
 
     if not isinstance(packet["sid"], str) or not packet["sid"]:
         return False
+
     if not isinstance(packet["d"], str) or not packet["d"]:
         return False
 
     try:
         idx = int(packet["i"])
         total = int(packet["n"])
+        crc = int(packet["c"])
     except (TypeError, ValueError):
         return False
 
     if total <= 0:
         return False
+
     if idx < 0 or idx >= total:
         return False
+
+    if crc < 0 or crc > 0xFFFFFFFF:
+        return False
+
     if packet_type == "tc" and "mid" not in packet:
         return False
 
     return True
-
 
 def add_transport_chunk(packet: dict[str, Any]) -> tuple[str, int | None, str] | None:
     cleanup_reassembly_buffers()
@@ -241,6 +247,16 @@ def add_transport_chunk(packet: dict[str, Any]) -> tuple[str, int | None, str] |
     chunk_index = int(packet["i"])
     chunk_total = int(packet["n"])
     data_fragment = packet["d"]
+    
+    expected_crc = int(packet["c"])
+    actual_crc = zlib.crc32(data_fragment.encode("utf-8")) & 0xFFFFFFFF
+
+    if actual_crc != expected_crc:
+        print(
+            f"[GROUND][CRC] bad chunk sid={session_id} mid={message_id} "
+            f"idx={chunk_index} expected={expected_crc:#010x} actual={actual_crc:#010x}"
+        )
+        return None
 
     key = (chunk_type, session_id, message_id)
 
@@ -328,7 +344,6 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
         frames.append(frame)
 
     return frames
-
 
 while True:
     try:

@@ -1,0 +1,56 @@
+"""
+AegisLEO chunking helpers
+
+Created by: Jamie Grunewald
+Date: 2026-03-24
+Version: v0.1.0
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from typing import Any
+
+
+def b64e(data: bytes) -> str:
+    return base64.b64encode(data).decode("utf-8")
+
+
+def b64d(data: str) -> bytes:
+    return base64.b64decode(data.encode("utf-8"))
+
+
+def chunk_text(text: str, chunk_size: int) -> list[str]:
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+def make_chunk_packets(
+    packet_type: str,
+    session_id: str,
+    payload_obj: dict[str, Any],
+    chunk_size: int,
+    message_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Serialize payload_obj to compact JSON and split into small chunk packets.
+    """
+    compact = json.dumps(payload_obj, separators=(",", ":"))
+    fragments = chunk_text(compact, chunk_size)
+
+    packets: list[dict[str, Any]] = []
+    total = len(fragments)
+
+    for idx, frag in enumerate(fragments):
+        pkt: dict[str, Any] = {
+            "t": packet_type,
+            "sid": session_id,
+            "i": idx,
+            "n": total,
+            "d": frag,
+        }
+        if message_id is not None:
+            pkt["mid"] = message_id
+        packets.append(pkt)
+
+    return packets
