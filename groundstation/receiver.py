@@ -1,45 +1,38 @@
 """
-AegisLEO Ground Station Secure Receiver (Chunked RF Version)
+AegisLEO Ground Station Secure Receiver
+Chunked RF Version with ACK/NACK Reassembly Control
 
 Created by: Jamie Grunewald
 Date: 2026-03-24
-Version: v0.7.0
+Version: v0.8.0
 
 Purpose
 -------
 This script runs on the ground station and listens for incoming
 secure telemetry packets from the satellite node.
 
-What this receiver does
------------------------
-1. Read small transport chunks from the LoRa serial bridge
-2. Reassemble those chunks into full logical packets
-3. Handle a signed session_init packet
-4. Handle signed, encrypted telemetry packets
-5. Decrypt telemetry using the established session AES key
-6. Parse telemetry frame
-7. Apply replay protection
-8. Run anomaly detection
-9. Print a clean operator view
+What this version adds
+----------------------
+This version adds:
 
-Why this version matters
-------------------------
-LoRa transparent serial links do not reliably carry large JSON packets as
-single units. So this receiver reconstructs them from smaller RF-safe chunks.
+- line-based transport parsing
+- chunk reassembly
+- ACK packets for successful message delivery
+- NACK packets for missing chunk indexes
+- replay protection after decryption
+- anomaly detection after successful decryption
 
-Transport chunk types
----------------------
-si -> session_init chunk
-tc -> telemetry chunk
+Why this matters
+----------------
+LoRa links can lose transport chunks.
 
-Important note
---------------
-The security model is preserved at the logical-packet layer:
-- session_init is still signed
-- telemetry is still signed
-- telemetry payload is still encrypted with AES-GCM
+So the ground station now:
+- tracks partial chunk sets
+- detects missing indexes
+- sends NACK when needed
+- sends ACK when a full logical packet is received
 
-Chunking only changes transport format, not core security intent.
+This gives us a clean and reliable RF transport overlay.
 """
 
 from __future__ import annotations
@@ -49,6 +42,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 import serial
 
@@ -72,12 +66,12 @@ SATELLITE_MLDSA_PUBLIC_KEY_PATH = "keys/satellite_mldsa_public.key"
 RECEIVER_KEM_PRIVATE_KEY_PATH = "dev_secrets/groundstation/receiver_kem_private.key"
 
 # Debug controls
-DEBUG_SERIAL = False
-DEBUG_CHUNKS = False
-DEBUG_REASSEMBLY = False
+DEBUG_CHUNKS = True
+DEBUG_REASSEMBLY = True
+DEBUG_ACKS = True
 
-# Drop incomplete chunk sets after this many seconds
-REASSEMBLY_TTL_SECONDS = 30
+# How long to keep an incomplete chunk set before declaring it stale
+REASSEMBLY_TTL_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------
@@ -97,6 +91,15 @@ with open(RECEIVER_KEM_PRIVATE_KEY_PATH, "rb") as f:
 class ChunkAssembly:
     """
     Hold the pieces of one logical packet while chunks arrive.
+
+    Fields
+    ------
+    total_chunks : int
+        How many chunks we expect for this logical packet.
+    created_at : float
+        When this chunk set first appeared.
+    parts : dict[int, str]
+        Maps chunk index -> chunk data fragment.
     """
     total_chunks: int
     created_at: float = field(default_factory=time.time)
@@ -108,16 +111,19 @@ class ChunkAssembly:
     def is_complete(self) -> bool:
         return len(self.parts) == self.total_chunks
 
+    def missing_indexes(self) -> list[int]:
+        return [i for i in range(self.total_chunks) if i not in self.parts]
+
     def assemble(self) -> str:
         """
-        Rebuild the original base64 payload in order.
+        Rebuild the original base64 payload in chunk order.
         """
         return "".join(self.parts[i] for i in range(self.total_chunks))
 
 
-def b64text_to_packet(text: str) -> dict:
+def b64text_to_packet(text: str) -> dict[str, Any]:
     """
-    Convert the assembled base64 text back into the original logical packet.
+    Convert an assembled base64 payload back into the original logical packet.
     """
     raw = base64.b64decode(text.encode("utf-8"))
     return json.loads(raw.decode("utf-8"))
@@ -131,17 +137,12 @@ ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 key_manager = KeyManager()
 detector = RuntimeDetector()
 
-# sessions[session_id] -> SessionState
 sessions: dict[str, object] = {}
-
-# replay_windows[session_id] -> ReplayWindow
 replay_windows: dict[str, ReplayWindow] = {}
 
-# reassembly_buffers[(chunk_type, session_id, message_id)] -> ChunkAssembly
+# Reassembly key:
+#   (chunk_type, session_id, message_id)
 reassembly_buffers: dict[tuple[str, str, int | None], ChunkAssembly] = {}
-
-# JSON decoder for small transport chunk packets
-decoder = json.JSONDecoder()
 
 print("Ground station secure receiver online")
 print(f"Serial port: {SERIAL_PORT}")
@@ -155,67 +156,83 @@ print("Press Ctrl+C to stop.")
 # ---------------------------------------------------------------------
 def pretty_time(epoch: int) -> str:
     """
-    Convert a Unix timestamp into a human-readable UTC string.
+    Convert Unix timestamp to UTC string for clean operator display.
     """
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def extract_next_json(buffer: str) -> tuple[dict | None, str]:
+def send_ack(session_id: str, message_id: int | None) -> None:
     """
-    Try to peel one JSON object off the front/middle of a text buffer.
-
-    Why this exists
-    ---------------
-    The serial bridge may still hand us:
-    - one clean chunk packet
-    - multiple chunk packets at once
-    - leading junk before a '{'
-
-    So we find the first '{' and ask the JSON decoder to parse one object.
+    Tell the transmitter that a full logical packet was successfully reassembled.
     """
-    start = buffer.find("{")
-    if start == -1:
-        return None, ""
+    pkt: dict[str, Any] = {"t": "ack", "sid": session_id}
+    if message_id is not None:
+        pkt["mid"] = message_id
 
-    candidate = buffer[start:]
+    wire = (json.dumps(pkt, separators=(",", ":")) + "\n").encode("utf-8")
+    ser.write(wire)
+    ser.flush()
 
-    try:
-        packet, end_idx = decoder.raw_decode(candidate)
-        remaining = candidate[end_idx:]
-        return packet, remaining
-    except json.JSONDecodeError:
-        # Not enough data yet for one complete transport chunk packet
-        return None, candidate
+    if DEBUG_ACKS:
+        print(f"[GROUND][ACK] sid={session_id} mid={message_id}")
+
+
+def send_nack(session_id: str, message_id: int | None, missing: list[int]) -> None:
+    """
+    Tell the transmitter which chunk indexes are missing.
+    """
+    pkt: dict[str, Any] = {"t": "nack", "sid": session_id, "missing": missing}
+    if message_id is not None:
+        pkt["mid"] = message_id
+
+    wire = (json.dumps(pkt, separators=(",", ":")) + "\n").encode("utf-8")
+    ser.write(wire)
+    ser.flush()
+
+    if DEBUG_ACKS:
+        print(f"[GROUND][NACK] sid={session_id} mid={message_id} missing={missing}")
 
 
 def cleanup_reassembly_buffers() -> None:
     """
-    Remove stale incomplete chunk sets so memory does not grow forever.
+    Remove stale incomplete chunk sets.
+
+    Before deleting them, send a NACK listing missing chunk indexes.
     """
     now = time.time()
-    stale_keys = [
-        key for key, buf in reassembly_buffers.items()
-        if now - buf.created_at > REASSEMBLY_TTL_SECONDS
-    ]
+    stale_keys: list[tuple[str, str, int | None]] = []
+
+    for key, buf in reassembly_buffers.items():
+        age = now - buf.created_at
+        if age > REASSEMBLY_TTL_SECONDS and not buf.is_complete():
+            stale_keys.append(key)
+
     for key in stale_keys:
-        del reassembly_buffers[key]
+        chunk_type, session_id, message_id = key
+        buf = reassembly_buffers[key]
+        missing = buf.missing_indexes()
+
+        # Ask sender to retransmit missing chunks
+        send_nack(session_id, message_id, missing)
+
+        # Reset timer by replacing buffer with a fresh holder that preserves parts
+        new_buf = ChunkAssembly(total_chunks=buf.total_chunks)
+        new_buf.parts = dict(buf.parts)
+        reassembly_buffers[key] = new_buf
 
 
-def add_transport_chunk(packet: dict) -> dict | None:
+def add_transport_chunk(packet: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Add one transport chunk packet to the appropriate reassembly bucket.
+    Add one transport chunk to its reassembly bucket.
 
-    Returns
-    -------
-    dict | None
-        The full logical packet when all chunks are present, else None.
+    Returns the full logical packet once complete.
+    Otherwise returns None.
     """
     cleanup_reassembly_buffers()
 
     chunk_type = packet["t"]
     session_id = packet["sid"]
     message_id = packet.get("mid")
-
     chunk_index = int(packet["i"])
     chunk_total = int(packet["n"])
     data_fragment = packet["d"]
@@ -230,7 +247,7 @@ def add_transport_chunk(packet: dict) -> dict | None:
 
     if DEBUG_CHUNKS:
         print(
-            f"[DEBUG] CHUNK t={chunk_type} sid={session_id} "
+            f"[GROUND][CHUNK] t={chunk_type} sid={session_id} "
             f"mid={message_id} idx={chunk_index}/{chunk_total - 1}"
         )
 
@@ -242,9 +259,12 @@ def add_transport_chunk(packet: dict) -> dict | None:
 
     if DEBUG_REASSEMBLY:
         print(
-            f"[DEBUG] REASSEMBLED t={chunk_type} sid={session_id} "
+            f"[GROUND][REASSEMBLED] t={chunk_type} sid={session_id} "
             f"mid={message_id} len={len(assembled_b64)}"
         )
+
+    # Logical packet reconstructed: send ACK immediately
+    send_ack(session_id, message_id)
 
     return b64text_to_packet(assembled_b64)
 
@@ -252,94 +272,45 @@ def add_transport_chunk(packet: dict) -> dict | None:
 # ---------------------------------------------------------------------
 # Main receive loop
 # ---------------------------------------------------------------------
-buffer = ""
-
 while True:
-    # Read serial bytes and append to rolling text buffer.
-    chunk = ser.read(1024)
+    try:
+        # Read one transport chunk packet per line.
+        line = ser.readline()
 
-    if not chunk:
-        continue
-
-    if DEBUG_SERIAL:
-        print(f"[DEBUG] RAW CHUNK: {repr(chunk[:120])}")
-
-    buffer += chunk.decode("utf-8", errors="ignore")
-
-    # Keep pulling out small transport chunk packets as they become available.
-    while True:
-        transport_packet, buffer = extract_next_json(buffer)
-
-        if transport_packet is None:
-            break
+        if not line:
+            cleanup_reassembly_buffers()
+            continue
 
         try:
-            # ---------------------------------------------------------
-            # Step 1: Reassemble transport chunks into full logical packet
-            # ---------------------------------------------------------
-            packet = add_transport_chunk(transport_packet)
+            transport_packet = json.loads(line.decode("utf-8").strip())
+        except json.JSONDecodeError:
+            print(f"[GROUND] WARN: invalid JSON line: {line[:80]!r}")
+            continue
 
-            # If packet is None, we do not have all chunks yet.
-            if packet is None:
-                continue
+        # Ignore control packets from the other side if they show up here.
+        if transport_packet.get("t") in {"ack", "nack"}:
+            continue
 
-            packet_type = packet.get("type")
+        # -------------------------------------------------------------
+        # Step 1: Reassemble transport chunks into full logical packet
+        # -------------------------------------------------------------
+        packet = add_transport_chunk(transport_packet)
 
-            # ---------------------------------------------------------
-            # Step 2: Handle session_init logical packet
-            # ---------------------------------------------------------
-            if packet_type == "session_init":
-                packet_core = {
-                    "type": packet["type"],
-                    "spacecraft_id": packet["spacecraft_id"],
-                    "session_id": packet["session_id"],
-                    "kem_ciphertext": packet["kem_ciphertext"],
-                }
+        # If not complete yet, wait for more chunks
+        if packet is None:
+            continue
 
-                is_valid_signature = verify(
-                    canonical_json_bytes(packet_core),
-                    b64d(packet["signature"]),
-                    SATELLITE_MLDSA_PUBLIC_KEY,
-                    algorithm=MLDSA_ALGORITHM,
-                )
+        packet_type = packet.get("type")
 
-                if not is_valid_signature:
-                    print("[GROUND] REJECTED: session_init signature verification failed")
-                    continue
-
-                session_id = packet["session_id"]
-
-                if session_id in sessions:
-                    print(f"[GROUND] INFO: session already exists ({session_id})")
-                    continue
-
-                print(f"[GROUND] Received session_init: {session_id}")
-
-                session = key_manager.create_receiver_session(
-                    kem_ciphertext=b64d(packet["kem_ciphertext"]),
-                    receiver_private_key=RECEIVER_KEM_PRIVATE_KEY,
-                    session_id=session_id,
-                )
-
-                sessions[session_id] = session
-                replay_windows[session_id] = ReplayWindow(window_size=64)
-
-                print(f"[GROUND] Session established: {session_id}")
-                continue
-
-            # ---------------------------------------------------------
-            # Step 3: Handle telemetry logical packet
-            # ---------------------------------------------------------
-            if packet_type != "telemetry":
-                print(f"[GROUND] WARN: unknown logical packet type: {packet_type}")
-                continue
-
+        # =============================================================
+        # SESSION INIT
+        # =============================================================
+        if packet_type == "session_init":
             packet_core = {
                 "type": packet["type"],
                 "spacecraft_id": packet["spacecraft_id"],
                 "session_id": packet["session_id"],
-                "nonce": packet["nonce"],
-                "ciphertext": packet["ciphertext"],
+                "kem_ciphertext": packet["kem_ciphertext"],
             }
 
             is_valid_signature = verify(
@@ -350,96 +321,142 @@ while True:
             )
 
             if not is_valid_signature:
-                print("[GROUND] REJECTED: telemetry signature verification failed")
+                print("[GROUND] REJECTED: session_init signature invalid")
                 continue
 
             session_id = packet["session_id"]
 
-            if session_id not in sessions:
-                print(f"[GROUND] WARN: telemetry received before session established ({session_id})")
+            if session_id in sessions:
+                print(f"[GROUND] INFO: session already exists ({session_id})")
                 continue
 
-            session = sessions[session_id]
-            replay_window = replay_windows[session_id]
+            print(f"[GROUND] Received session_init: {session_id}")
 
-            if session.is_expired():
-                print(f"[GROUND] REJECTED: session expired ({session_id})")
-                continue
-
-            # ---------------------------------------------------------
-            # Step 4: Decrypt telemetry payload
-            # ---------------------------------------------------------
-            plaintext = decrypt(
-                b64d(packet["nonce"]),
-                b64d(packet["ciphertext"]),
-                session.aes_key,
-                aad=packet["spacecraft_id"].encode("utf-8"),
+            session = key_manager.create_receiver_session(
+                kem_ciphertext=b64d(packet["kem_ciphertext"]),
+                receiver_private_key=RECEIVER_KEM_PRIVATE_KEY,
+                session_id=session_id,
             )
 
-            # ---------------------------------------------------------
-            # Step 5: Parse decrypted telemetry frame
-            # ---------------------------------------------------------
-            frame = parse_json_bytes(plaintext)
+            sessions[session_id] = session
+            replay_windows[session_id] = ReplayWindow(window_size=64)
 
-            # ---------------------------------------------------------
-            # Step 6: Replay protection
-            # ---------------------------------------------------------
-            sequence = int(frame["sequence"])
+            print(f"[GROUND] Session established: {session_id}")
+            continue
 
-            decision = replay_window.check(sequence)
-            if not decision.accepted:
-                print(
-                    f"[GROUND] REJECTED: replay protection blocked packet "
-                    f"(session={session_id}, seq={sequence}, reason={decision.reason})"
-                )
-                continue
+        # =============================================================
+        # TELEMETRY
+        # =============================================================
+        if packet_type != "telemetry":
+            print(f"[GROUND] WARN: unknown logical packet type: {packet_type}")
+            continue
 
-            previous_max = replay_window.max_seq
-            replay_window.record(sequence)
+        packet_core = {
+            "type": packet["type"],
+            "spacecraft_id": packet["spacecraft_id"],
+            "session_id": packet["session_id"],
+            "nonce": packet["nonce"],
+            "ciphertext": packet["ciphertext"],
+        }
 
-            # ---------------------------------------------------------
-            # Step 7: Compute packet gap
-            # ---------------------------------------------------------
-            gap = 0
-            if previous_max != -1 and sequence > previous_max + 1:
-                gap = sequence - previous_max - 1
+        is_valid_signature = verify(
+            canonical_json_bytes(packet_core),
+            b64d(packet["signature"]),
+            SATELLITE_MLDSA_PUBLIC_KEY,
+            algorithm=MLDSA_ALGORITHM,
+        )
 
-            # ---------------------------------------------------------
-            # Step 8: Run anomaly detection
-            # ---------------------------------------------------------
-            detection = detector.detect(frame)
+        if not is_valid_signature:
+            print("[GROUND] REJECTED: telemetry signature invalid")
+            continue
 
-            # ---------------------------------------------------------
-            # Step 9: Print clean operator view
-            # ---------------------------------------------------------
-            payload = frame["payload"]
+        session_id = packet["session_id"]
 
-            print("=" * 72)
-            print("AegisLEO Secure Telemetry Packet")
-            print(f"Spacecraft : {frame['spacecraft_id']}")
-            print(f"Session ID : {session_id}")
-            print(f"Timestamp  : {pretty_time(frame['timestamp'])}")
-            print(f"APID       : {frame['apid']}")
-            print(f"Sequence   : {sequence}")
-            print(f"Gap        : {gap}")
-            print(f"Replay     : ACCEPTED ({decision.reason})")
-            print("Crypto     : signature=VALID, session=ACTIVE, decrypt=SUCCESS")
+        if session_id not in sessions:
+            print(f"[GROUND] WARN: telemetry before session ({session_id})")
+            continue
 
-            if detection.is_anomalous:
-                print(
-                    f"ML         : ANOMALY "
-                    f"(score={detection.score}, reasons={detection.reasons})"
-                )
-            else:
-                print(f"ML         : nominal (score={detection.score})")
+        session = sessions[session_id]
+        replay_window = replay_windows[session_id]
 
+        if session.is_expired():
+            print(f"[GROUND] REJECTED: session expired ({session_id})")
+            continue
+
+        # -------------------------------------------------------------
+        # Step 2: Decrypt logical telemetry packet
+        # -------------------------------------------------------------
+        plaintext = decrypt(
+            b64d(packet["nonce"]),
+            b64d(packet["ciphertext"]),
+            session.aes_key,
+            aad=packet["spacecraft_id"].encode("utf-8"),
+        )
+
+        # -------------------------------------------------------------
+        # Step 3: Parse decrypted CCSDS-inspired frame
+        # -------------------------------------------------------------
+        frame = parse_json_bytes(plaintext)
+
+        # -------------------------------------------------------------
+        # Step 4: Replay protection
+        # -------------------------------------------------------------
+        sequence = int(frame["sequence"])
+
+        decision = replay_window.check(sequence)
+        if not decision.accepted:
             print(
-                f"Payload    : temp_c={payload['temp_c']} "
-                f"bus_v={payload['bus_v']} "
-                f"bus_i={payload['bus_i']} "
-                f"state={payload['state']}"
+                f"[GROUND] REJECTED: replay blocked "
+                f"(session={session_id}, seq={sequence}, reason={decision.reason})"
             )
-            print("=" * 72)
+            continue
 
-        except Exception as exc:
-            print(f"[GROUND] WARN: packet processing failed: {exc}")
+        previous_max = replay_window.max_seq
+        replay_window.record(sequence)
+
+        # -------------------------------------------------------------
+        # Step 5: Compute packet gap for operator visibility
+        # -------------------------------------------------------------
+        gap = 0
+        if previous_max != -1 and sequence > previous_max + 1:
+            gap = sequence - previous_max - 1
+
+        # -------------------------------------------------------------
+        # Step 6: Run anomaly detection
+        # -------------------------------------------------------------
+        detection = detector.detect(frame)
+
+        # -------------------------------------------------------------
+        # Step 7: Print operator view
+        # -------------------------------------------------------------
+        payload = frame["payload"]
+
+        print("=" * 72)
+        print("AegisLEO Secure Telemetry Packet")
+        print(f"Spacecraft : {frame['spacecraft_id']}")
+        print(f"Session ID : {session_id}")
+        print(f"Timestamp  : {pretty_time(frame['timestamp'])}")
+        print(f"APID       : {frame['apid']}")
+        print(f"Sequence   : {sequence}")
+        print(f"Gap        : {gap}")
+        print(f"Replay     : ACCEPTED ({decision.reason})")
+        print("Crypto     : signature=VALID, session=ACTIVE, decrypt=SUCCESS")
+
+        if detection.is_anomalous:
+            print(
+                f"ML         : ANOMALY "
+                f"(score={detection.score}, reasons={detection.reasons})"
+            )
+        else:
+            print(f"ML         : nominal (score={detection.score})")
+
+        print(
+            f"Payload    : temp_c={payload['temp_c']} "
+            f"bus_v={payload['bus_v']} "
+            f"bus_i={payload['bus_i']} "
+            f"state={payload['state']}"
+        )
+        print("=" * 72)
+
+    except Exception as exc:
+        print(f"[GROUND] WARN: {exc}")

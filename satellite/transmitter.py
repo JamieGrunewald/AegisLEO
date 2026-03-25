@@ -1,49 +1,46 @@
 """
-AegisLEO Secure Satellite Telemetry Transmitter (Chunked RF Version)
+AegisLEO Secure Satellite Telemetry Transmitter
+Chunked RF Version with ACK/NACK Retransmission
 
 Created by: Jamie Grunewald
 Date: 2026-03-24
-Version: v0.7.0
+Version: v0.8.0
 
 Purpose
 -------
 This script runs on the satellite-side node and sends secure telemetry
 to the ground station over the LoRa serial link.
 
-What this transmitter does
---------------------------
-For every telemetry update, it will:
+What this version adds
+----------------------
+This version adds:
 
-1. Load the ground station's ML-KEM public key
-2. Create a PQ session and derive an AES-256 session key
-3. Build a signed session_init packet
-4. Chunk that packet into small RF-safe transport chunks
-5. Send session_init chunks once
-6. Build encrypted + signed telemetry packets
-7. Chunk telemetry packets into small RF-safe transport chunks
-8. Send those chunks over serial/LoRa
+- RF-safe chunking
+- line-based transport packets
+- ACK handling
+- NACK handling
+- selective chunk retransmission
 
-Why chunking exists
--------------------
-LoRa transparent serial bridges are not great at carrying large JSON blobs.
-So instead of sending one giant packet, we:
+Why ACK/NACK matters
+--------------------
+LoRa links can lose or delay packets.
 
-- serialize the full logical packet
-- base64-encode it
-- split it into small chunks
-- send one chunk per line of JSON
+So instead of blindly transmitting and hoping for the best, we:
 
-The receiver reassembles the pieces.
+1. send chunk packets
+2. keep a copy of each sent chunk set
+3. wait for ACK from the receiver
+4. if NACK arrives, retransmit only missing chunks
+5. if ACK arrives, clear the sent message from memory
 
-Security note
--------------
-This version keeps:
-- ML-KEM for session establishment
-- AES-GCM for telemetry confidentiality + integrity
-- ML-DSA signatures on the full logical packets
+Security model
+--------------
+This version preserves the logical security model:
+- session_init logical packet is signed
+- telemetry logical packet is signed
+- telemetry payload is encrypted with AES-GCM
 
-So we are not throwing security away.
-We are only changing the transport format.
+Chunking only changes transport format.
 """
 
 from __future__ import annotations
@@ -51,7 +48,9 @@ from __future__ import annotations
 import base64
 import json
 import random
+import select
 import time
+from typing import Any
 
 import serial
 
@@ -70,12 +69,19 @@ BAUD_RATE = 115200
 SPACECRAFT_ID = "AegisLEO-SAT-1"
 APID = 100
 
-# Small chunk size for RF safety.
-# You can tune this later if needed.
-CHUNK_SIZE = 80
+# RF-safe chunk tuning
+CHUNK_SIZE = 32
+CHUNK_DELAY_SECONDS = 0.15
 
-# Small pause between chunk transmissions so we do not overwhelm the radio.
-CHUNK_DELAY_SECONDS = 0.05
+# How long to wait for an ACK after sending a message chunk set
+ACK_WAIT_SECONDS = 2.0
+
+# How many times to retry a message after NACK / timeout
+MAX_RETRIES = 3
+
+# Debug controls
+DEBUG_TX_CHUNKS = True
+DEBUG_ACKS = True
 
 
 # ---------------------------------------------------------------------
@@ -90,16 +96,14 @@ RECEIVER_KEM_PUBLIC_KEY_PATH = "dev_secrets/satellite/receiver_kem_public.key"
 # ---------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------
-def packet_to_base64(packet: dict) -> str:
+def packet_to_base64(packet: dict[str, Any]) -> str:
     """
-    Convert a full logical packet into compact JSON bytes, then base64 text.
+    Convert one full logical packet into compact JSON bytes, then base64 text.
 
     Why we do this
     --------------
-    The full packet may contain lots of characters that are awkward to split
-    directly inside another JSON wrapper.
-
-    Base64 gives us a safe ASCII payload made of simple characters.
+    The full logical packet may be large and contain many characters.
+    Base64 turns it into safe ASCII text that is easy to split into chunks.
     """
     raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(raw).decode("utf-8")
@@ -118,25 +122,25 @@ def make_chunk_packets(
     encoded_payload: str,
     chunk_size: int,
     message_id: int | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
-    Wrap a long base64 payload in small transport chunks.
+    Wrap a long encoded payload in small transport chunk packets.
 
-    Chunk packet format
-    -------------------
-    t   -> transport type
+    Transport chunk packet fields
+    -----------------------------
+    t   -> chunk type ("si" or "tc")
     sid -> session ID
-    mid -> message ID (telemetry only)
+    mid -> logical message ID (used for telemetry, omitted for session_init)
     i   -> chunk index
-    n   -> total number of chunks
+    n   -> total chunks
     d   -> data fragment
     """
     fragments = split_chunks(encoded_payload, chunk_size)
     total = len(fragments)
 
-    packets: list[dict] = []
+    packets: list[dict[str, Any]] = []
     for idx, frag in enumerate(fragments):
-        pkt = {
+        pkt: dict[str, Any] = {
             "t": chunk_type,
             "sid": session_id,
             "i": idx,
@@ -150,18 +154,127 @@ def make_chunk_packets(
     return packets
 
 
-def send_chunk_packets(ser: serial.Serial, packets: list[dict]) -> None:
+def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     """
-    Send chunk packets one line at a time.
+    Send exactly one small line-based transport packet.
 
-    Each chunk packet is small and newline-delimited so the receiver can
-    consume one transport chunk at a time.
+    Important
+    ---------
+    The LoRa bridge behaved well with newline-delimited transport packets,
+    so every write ends with '\\n'.
     """
-    for pkt in packets:
-        wire_bytes = (json.dumps(pkt, separators=(",", ":")) + "\n").encode("utf-8")
-        ser.write(wire_bytes)
-        ser.flush()
+    wire = (json.dumps(pkt, separators=(",", ":")) + "\n").encode("utf-8")
+    ser.write(wire)
+    ser.flush()
+
+
+def send_chunk_packets(ser: serial.Serial, packets: list[dict[str, Any]]) -> None:
+    """
+    Send a whole set of chunk packets with a small delay between each one.
+    """
+    total = len(packets)
+    for idx, pkt in enumerate(packets):
+        write_transport_packet(ser, pkt)
+        if DEBUG_TX_CHUNKS:
+            print(
+                f"[SAT][CHUNK] t={pkt['t']} sid={pkt['sid']} "
+                f"mid={pkt.get('mid')} idx={idx + 1}/{total}"
+            )
         time.sleep(CHUNK_DELAY_SECONDS)
+
+
+def read_transport_line(ser: serial.Serial, timeout_seconds: float) -> dict[str, Any] | None:
+    """
+    Wait briefly for one incoming transport packet from the receiver.
+
+    Used for:
+    - ACK packets
+    - NACK packets
+
+    Returns None if nothing valid arrives before timeout.
+    """
+    end_time = time.time() + timeout_seconds
+
+    while time.time() < end_time:
+        ready, _, _ = select.select([ser.fileno()], [], [], 0.1)
+        if not ready:
+            continue
+
+        line = ser.readline()
+        if not line:
+            continue
+
+        try:
+            return json.loads(line.decode("utf-8").strip())
+        except json.JSONDecodeError:
+            # Ignore malformed control-plane input
+            continue
+
+    return None
+
+
+def wait_for_ack_or_nack(
+    ser: serial.Serial,
+    session_id: str,
+    message_id: int | None,
+    pending_chunks: list[dict[str, Any]],
+) -> bool:
+    """
+    Wait for ACK/NACK and handle selective retransmission.
+
+    Returns
+    -------
+    bool
+        True if ACK received.
+        False if delivery failed after retries.
+
+    Behavior
+    --------
+    - session_init does not use a message ID, so it is matched with mid=None
+    - telemetry uses the sequence number as message ID
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        control = read_transport_line(ser, ACK_WAIT_SECONDS)
+
+        if control is None:
+            if DEBUG_ACKS:
+                print(
+                    f"[SAT][ACK] timeout sid={session_id} mid={message_id} "
+                    f"attempt={attempt}/{MAX_RETRIES}"
+                )
+            # Timeout: retransmit whole message set
+            send_chunk_packets(ser, pending_chunks)
+            continue
+
+        if control.get("sid") != session_id:
+            continue
+
+        if control.get("mid") != message_id:
+            continue
+
+        control_type = control.get("t")
+
+        if control_type == "ack":
+            if DEBUG_ACKS:
+                print(f"[SAT][ACK] received sid={session_id} mid={message_id}")
+            return True
+
+        if control_type == "nack":
+            missing = control.get("missing", [])
+            if DEBUG_ACKS:
+                print(
+                    f"[SAT][NACK] sid={session_id} mid={message_id} "
+                    f"missing={missing} attempt={attempt}/{MAX_RETRIES}"
+                )
+
+            resend = [pkt for pkt in pending_chunks if pkt["i"] in missing]
+            if not resend:
+                # If missing list is weird/empty, fall back to full resend
+                resend = pending_chunks
+            send_chunk_packets(ser, resend)
+            continue
+
+    return False
 
 
 # ---------------------------------------------------------------------
@@ -188,11 +301,11 @@ kem_ciphertext = initiator_handshake.kem_ciphertext
 
 
 # ---------------------------------------------------------------------
-# Open the serial interface to the LoRa radio
+# Open serial interface to the LoRa radio
 # ---------------------------------------------------------------------
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 
-# Packet sequence counter
+# Logical telemetry sequence counter
 sequence = 1
 
 
@@ -211,7 +324,7 @@ print("Press Ctrl+C to stop.")
 # ---------------------------------------------------------------------
 # Send session_init once
 # ---------------------------------------------------------------------
-# Step 1: Build the unsigned session_init core
+# Step 1: Build unsigned session_init core
 session_init_core = {
     "type": "session_init",
     "spacecraft_id": SPACECRAFT_ID,
@@ -219,28 +332,29 @@ session_init_core = {
     "kem_ciphertext": b64e(kem_ciphertext),
 }
 
-# Step 2: Sign the session_init core
+# Step 2: Sign session_init logical packet
 session_init_signature = sign(
     canonical_json_bytes(session_init_core),
     MLDSA_SECRET_KEY,
     algorithm=MLDSA_ALGORITHM,
 )
 
-# Step 3: Build the final logical session_init packet
+# Step 3: Build final logical session_init packet
 session_init_packet = {
     **session_init_core,
     "signature": b64e(session_init_signature),
 }
 
-# Step 4: Convert the full logical packet to base64 text
+# Step 4: Convert to base64 text for chunking
 session_init_b64 = packet_to_base64(session_init_packet)
 
-# Step 5: Split into small RF-safe transport chunks
+# Step 5: Build RF transport chunks
 session_init_chunks = make_chunk_packets(
-    chunk_type="si",              # session_init transport chunk
+    chunk_type="si",
     session_id=session.session_id,
     encoded_payload=session_init_b64,
     chunk_size=CHUNK_SIZE,
+    message_id=None,
 )
 
 # Step 6: Send all chunks
@@ -251,7 +365,21 @@ print(
     f"({len(session_init_chunks)} chunks)"
 )
 
-# Small pause so the receiver has time to establish the session.
+# Step 7: Wait for ACK/NACK from receiver
+session_init_ok = wait_for_ack_or_nack(
+    ser=ser,
+    session_id=session.session_id,
+    message_id=None,
+    pending_chunks=session_init_chunks,
+)
+
+if not session_init_ok:
+    print("[SAT] ERROR: session_init delivery failed after retries")
+    raise SystemExit(1)
+
+print("[SAT] session_init acknowledged by ground station")
+
+# Small pause so ground station can finish session setup
 time.sleep(1)
 
 
@@ -270,7 +398,7 @@ while True:
     }
 
     # -------------------------------------------------------------
-    # Step 2: Build the CCSDS-inspired telemetry frame
+    # Step 2: Build CCSDS-inspired telemetry frame
     # -------------------------------------------------------------
     frame = build_frame(
         spacecraft_id=SPACECRAFT_ID,
@@ -285,7 +413,7 @@ while True:
     frame_bytes = canonical_json_bytes(frame)
 
     # -------------------------------------------------------------
-    # Step 4: Encrypt the telemetry frame with AES-GCM
+    # Step 4: Encrypt telemetry frame with AES-GCM
     # -------------------------------------------------------------
     encrypted = encrypt(
         frame_bytes,
@@ -294,7 +422,7 @@ while True:
     )
 
     # -------------------------------------------------------------
-    # Step 5: Build the unsigned telemetry packet core
+    # Step 5: Build unsigned telemetry logical packet
     # -------------------------------------------------------------
     packet_core = {
         "type": "telemetry",
@@ -305,7 +433,7 @@ while True:
     }
 
     # -------------------------------------------------------------
-    # Step 6: Sign the telemetry packet core
+    # Step 6: Sign logical telemetry packet
     # -------------------------------------------------------------
     telemetry_signature = sign(
         canonical_json_bytes(packet_core),
@@ -314,7 +442,7 @@ while True:
     )
 
     # -------------------------------------------------------------
-    # Step 7: Build the final logical telemetry packet
+    # Step 7: Build final logical telemetry packet
     # -------------------------------------------------------------
     transmitted_packet = {
         **packet_core,
@@ -322,19 +450,19 @@ while True:
     }
 
     # -------------------------------------------------------------
-    # Step 8: Convert logical telemetry packet to base64 text
+    # Step 8: Convert full logical telemetry packet to base64 text
     # -------------------------------------------------------------
     telemetry_b64 = packet_to_base64(transmitted_packet)
 
     # -------------------------------------------------------------
-    # Step 9: Split telemetry into RF-safe chunks
+    # Step 9: Split logical telemetry packet into RF-safe chunks
     # -------------------------------------------------------------
     telemetry_chunks = make_chunk_packets(
-        chunk_type="tc",              # telemetry transport chunk
+        chunk_type="tc",
         session_id=session.session_id,
         encoded_payload=telemetry_b64,
         chunk_size=CHUNK_SIZE,
-        message_id=sequence,          # helps receiver group chunk sets
+        message_id=sequence,
     )
 
     # -------------------------------------------------------------
@@ -349,7 +477,20 @@ while True:
     )
 
     # -------------------------------------------------------------
-    # Step 11: Increment packet sequence number and wait
+    # Step 11: Wait for ACK/NACK
+    # -------------------------------------------------------------
+    delivery_ok = wait_for_ack_or_nack(
+        ser=ser,
+        session_id=session.session_id,
+        message_id=sequence,
+        pending_chunks=telemetry_chunks,
+    )
+
+    if not delivery_ok:
+        print(f"[SAT] ERROR: telemetry seq={sequence} failed after retries")
+
+    # -------------------------------------------------------------
+    # Step 12: Move to next telemetry message
     # -------------------------------------------------------------
     sequence += 1
     time.sleep(3)
