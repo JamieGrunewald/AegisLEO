@@ -578,9 +578,14 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
 
         end = buffer.find(FRAME_END, 1)
         if end == -1:
-            # Frame not complete yet.
-            # If buffer is absurdly large, drop one byte and try to resync.
+            # We found FRAME_START but not FRAME_END yet.
+            # Usually this means the frame is incomplete and we should wait for more bytes.
+            #
+            # If the buffer grows too large without an end marker, assume we lost sync
+            # and drop one byte so the parser can hunt for the next valid frame.
             if len(buffer) > MAX_FRAME_JSON_BYTES + 2:
+                if DEBUG_BAD_FRAMES:
+                    print(f"[GROUND] WARN: no FRAME_END yet, dropping 1 byte to resync (buffer={len(buffer)})")
                 del buffer[0]
             break
 
@@ -607,7 +612,8 @@ while True:
     try:
         # Read a larger chunk from serial each cycle.
         # This may help on noisy links where packets arrive in clumps.
-        incoming = ser.read(512)
+        #incoming = ser.read(512)
+        incoming = ser.read(2048)
 
         if incoming:
             serial_buffer.extend(incoming)
