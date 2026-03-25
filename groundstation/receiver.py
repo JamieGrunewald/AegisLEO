@@ -3,7 +3,7 @@ AegisLEO Ground Station Secure Receiver
 
 Created by: Jamie Grunewald
 Date: 2026-03-24
-Version: v0.6.1
+Version: v0.6.2
 
 Purpose
 -------
@@ -29,6 +29,10 @@ Why this version matters
 LoRa serial bridges do not always preserve newline or packet boundaries.
 So this receiver uses a rolling text buffer and incremental JSON decoding
 to reconstruct complete JSON objects from partial serial chunks.
+
+This version also adds temporary debug output so we can see:
+- raw chunks arriving from serial
+- whether the buffer is growing but never forming valid JSON
 """
 
 from __future__ import annotations
@@ -57,6 +61,10 @@ MLDSA_ALGORITHM = "ML-DSA-65"
 SATELLITE_MLDSA_PUBLIC_KEY_PATH = "keys/satellite_mldsa_public.key"
 RECEIVER_KEM_PRIVATE_KEY_PATH = "dev_secrets/groundstation/receiver_kem_private.key"
 
+# Temporary debug controls
+DEBUG_SERIAL = True
+DEBUG_BUFFER = True
+
 
 # ---------------------------------------------------------------------
 # Load key material
@@ -76,13 +84,9 @@ ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 key_manager = KeyManager()
 detector = RuntimeDetector()
 
-# sessions[session_id] -> SessionState
 sessions: dict[str, object] = {}
-
-# replay_windows[session_id] -> ReplayWindow
 replay_windows: dict[str, ReplayWindow] = {}
 
-# Incremental JSON decoder for rebuilding packets from serial chunks
 decoder = json.JSONDecoder()
 
 print("Ground station secure receiver online")
@@ -104,27 +108,18 @@ def pretty_time(epoch: int) -> str:
 
 def extract_next_json(buffer: str) -> tuple[dict | None, str]:
     """
-    Attempt to extract one complete JSON object from the front/middle of a text buffer.
+    Attempt to extract one complete JSON object from a text buffer.
 
-    Why this exists
-    ---------------
-    The LoRa USB serial bridge may deliver:
-    - partial JSON objects
-    - multiple JSON objects in one chunk
-    - extra junk before a valid '{'
-
-    So we:
-    1. find the first '{'
-    2. try incremental JSON decoding from there
-    3. if successful, return the parsed object + remaining buffer
-    4. if incomplete, keep the buffer and wait for more bytes
+    Returns
+    -------
+    tuple[dict | None, str]
+        - parsed JSON object if successful, else None
+        - remaining buffer
     """
     start = buffer.find("{")
     if start == -1:
-        # No JSON start found at all. Drop noise.
         return None, ""
 
-    # Drop leading junk before the first JSON object.
     candidate = buffer[start:]
 
     try:
@@ -132,7 +127,6 @@ def extract_next_json(buffer: str) -> tuple[dict | None, str]:
         remaining = candidate[end_idx:]
         return packet, remaining
     except json.JSONDecodeError:
-        # Incomplete JSON object. Keep data from first '{' onward.
         return None, candidate
 
 
@@ -142,17 +136,19 @@ def extract_next_json(buffer: str) -> tuple[dict | None, str]:
 buffer = ""
 
 while True:
-    # Read a chunk of bytes from serial instead of using readline().
-    # This is more reliable when the radio bridge splits packets.
     chunk = ser.read(1024)
 
     if not chunk:
         continue
 
-    # Decode what we got into text and append to rolling buffer.
+    if DEBUG_SERIAL:
+        print(f"[DEBUG] RAW CHUNK: {repr(chunk[:120])}")
+
     buffer += chunk.decode("utf-8", errors="ignore")
 
-    # Keep trying to peel complete JSON objects out of the buffer.
+    if DEBUG_BUFFER and len(buffer) > 300:
+        print(f"[DEBUG] BUFFER LEN: {len(buffer)}")
+
     while True:
         packet, buffer = extract_next_json(buffer)
 
@@ -275,7 +271,7 @@ while True:
             replay_window.record(sequence)
 
             # ---------------------------------------------------------
-            # Step 6: Compute packet gap
+            # Step 6: Compute gap
             # ---------------------------------------------------------
             gap = 0
             if previous_max != -1 and sequence > previous_max + 1:
