@@ -246,7 +246,7 @@ while True:
                 b64d(packet["nonce"]),
                 b64d(packet["ciphertext"]),
                 session.aes_key,
-                aad=b"AegisLEO-SAT-1")
+                aad=b"AegisLEO-SAT-1"
                 #aad=packet["spacecraft_id"].encode("utf-8"),
             )
 
