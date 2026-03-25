@@ -5,14 +5,15 @@ Transport-Hardened RF Version with Selective session_init Recovery
 Created by: Jamie Grunewald
 Updated by: OpenAI ChatGPT
 Date: 2026-03-25
-Version: v0.11.1
+Version: v0.11.2
 
-v0.11.1 patch notes
+v0.11.2 patch notes
 -------------------
-1. selective resend added for session_init
-2. stricter control-frame UTF-8 parsing restored
-3. control packet matching supports session_init ACK/NACK without mid
-4. operator logging improved
+1. stronger control-plane quiet windows
+2. larger control read window
+3. control RX logging added
+4. initial burst pacing cleaned up
+5. session_init retry pacing tuned for half-duplex link behavior
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ APID = 100
 SESSION_INIT_CHUNK_SIZE = 160
 TELEMETRY_CHUNK_SIZE = 180
 
-SESSION_INIT_CHUNK_DELAY_SECONDS = 0.25
+SESSION_INIT_CHUNK_DELAY_SECONDS = 0.30
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
 
 ACK_WAIT_SECONDS = 5.0
@@ -130,7 +131,6 @@ def send_chunk_packets(
         time.sleep(delay_seconds)
 
 
-
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     frames: list[bytes] = []
 
@@ -170,11 +170,11 @@ def read_control_packet(ser: serial.Serial, timeout_seconds: float) -> dict[str,
     rx_buffer = bytearray()
 
     while time.time() < end_time:
-        ready, _, _ = select.select([ser.fileno()], [], [], 0.1)
+        ready, _, _ = select.select([ser.fileno()], [], [], 0.2)
         if not ready:
             continue
 
-        raw = ser.read(256)
+        raw = ser.read(512)
         if not raw:
             continue
 
@@ -235,17 +235,28 @@ def wait_for_ack_or_nack(
     for attempt in range(1, MAX_RETRIES + 1):
         control = read_control_packet(ser, ACK_WAIT_SECONDS)
 
+        if control is not None:
+            print(f"[SAT][CTRL RX] {control}")
+
         if control is None:
             if DEBUG_ACKS:
                 print(
                     f"[SAT][ACK] timeout sid={session_id} mid={message_id} "
                     f"attempt={attempt}/{MAX_RETRIES}"
                 )
+                print("[SAT] waiting before retry burst")
+
+            time.sleep(1.0)
             send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
-            time.sleep(0.5)
+            time.sleep(1.0)
             continue
 
         if not control_matches_session(control, session_id, message_id):
+            if DEBUG_ACKS:
+                print(
+                    f"[SAT][CTRL RX] ignoring control for sid={control.get('sid')} "
+                    f"mid={control.get('mid')}"
+                )
             continue
 
         control_type = control.get("t")
@@ -262,7 +273,10 @@ def wait_for_ack_or_nack(
                     f"[SAT][NACK] sid={session_id} mid={message_id} "
                     f"missing={missing} attempt={attempt}/{MAX_RETRIES}"
                 )
+
+            time.sleep(0.5)
             resend_missing_chunks(ser, pending_chunks, missing, resend_delay_seconds)
+            time.sleep(1.0)
             continue
 
     return False
@@ -338,7 +352,8 @@ print(
     f"({len(session_init_chunks)} chunks)"
 )
 
-time.sleep(0.5)
+# Quiet window for control-plane response after the burst.
+time.sleep(1.0)
 
 session_init_ok = wait_for_ack_or_nack(
     ser=ser,
@@ -421,7 +436,7 @@ while True:
             f"payload={payload}"
         )
 
-    time.sleep(0.5)
+    time.sleep(1.0)
 
     delivery_ok = wait_for_ack_or_nack(
         ser=ser,
