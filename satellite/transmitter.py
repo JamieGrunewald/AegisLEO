@@ -5,7 +5,7 @@ Transport-Hardened RF Version with Selective session_init Recovery
 Created by: Jamie Grunewald
 Updated by: OpenAI ChatGPT
 Date: 2026-03-25
-Version: v0.11.2
+Version: v0.11.4
 
 v0.11.2 patch notes
 -------------------
@@ -42,7 +42,7 @@ APID = 100
 SESSION_INIT_CHUNK_SIZE = 220
 TELEMETRY_CHUNK_SIZE = 180
 
-SESSION_INIT_CHUNK_DELAY_SECONDS = 0.35
+SESSION_INIT_CHUNK_DELAY_SECONDS = 0.45
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
 
 ACK_WAIT_SECONDS = 15.0
@@ -232,24 +232,20 @@ def wait_for_ack_or_nack(
     resend_delay_seconds: float,
 ) -> bool:
     """
-    Wait for ACK/NACK with different behavior for:
-    - session_init (message_id is None): long-listen, low-chatter control recovery
-    - telemetry: normal timeout/retry behavior
+    Improved session_init recovery logic:
 
-    Why this exists
-    ---------------
-    session_init is large and expensive. The receiver may take a while to decide
-    what is missing and emit a useful NACK. If we keep blasting the whole burst
-    too quickly, we can starve the reverse/control path.
+    Key behavior:
+    - Listen FIRST
+    - After first NACK -> switch to selective-only mode
+    - Never resend full burst again after NACK
     """
 
     # -------------------------------------------------------------
-    # SESSION INIT: listen-first mode
+    # SESSION INIT: selective-lock recovery mode
     # -------------------------------------------------------------
     if message_id is None:
-        # We allow more listen cycles than telemetry because the receiver may
-        # not send NACK until its stale timer fires.
-        session_listen_cycles = 10
+        session_listen_cycles = 12
+        seen_nack = False  # 🔥 critical new state
 
         for cycle in range(1, session_listen_cycles + 1):
             control = read_control_packet(ser, ACK_WAIT_SECONDS)
@@ -257,27 +253,29 @@ def wait_for_ack_or_nack(
             if control is not None:
                 print(f"[SAT][CTRL RX] {control}")
 
+            # -----------------------------------------------------
+            # NOTHING RECEIVED
+            # -----------------------------------------------------
             if control is None:
                 if DEBUG_ACKS:
                     print(
-                        f"[SAT][ACK] session_init quiet-listen timeout "
+                        f"[SAT][ACK] session_init quiet timeout "
                         f"sid={session_id} cycle={cycle}/{session_listen_cycles}"
                     )
 
-                # Do NOT immediately re-blast the whole burst every cycle.
-                # Give the receiver more room to send control traffic.
-                #
-                # Only after every 3rd quiet cycle do we resend the full burst
-                # as a recovery nudge.
-                if cycle % 3 == 0:
-                    if DEBUG_ACKS:
-                        print("[SAT] session_init resend-all after extended quiet window")
-                    time.sleep(1.5)
+                # 🚫 BEFORE NACK: occasional resend-all (rare)
+                if not seen_nack and cycle % 4 == 0:
+                    print("[SAT] pre-NACK recovery burst (rare resend-all)")
+                    time.sleep(2.0)
                     send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
-                    time.sleep(1.5)
+                    time.sleep(2.0)
 
+                # ✅ AFTER NACK: DO NOTHING (listen only)
                 continue
 
+            # -----------------------------------------------------
+            # FILTER WRONG SESSION
+            # -----------------------------------------------------
             if not control_matches_session(control, session_id, message_id):
                 if DEBUG_ACKS:
                     print(
@@ -288,29 +286,47 @@ def wait_for_ack_or_nack(
 
             control_type = control.get("t")
 
+            # -----------------------------------------------------
+            # ACK
+            # -----------------------------------------------------
             if control_type == "ack":
-                if DEBUG_ACKS:
-                    print(f"[SAT][ACK] received sid={session_id} mid={message_id}")
+                print(f"[SAT][ACK] received sid={session_id}")
                 return True
 
+            # -----------------------------------------------------
+            # NACK (THIS IS THE IMPORTANT PATH)
+            # -----------------------------------------------------
             if control_type == "nack":
                 missing = control.get("m", [])
-                if DEBUG_ACKS:
-                    print(
-                        f"[SAT][NACK] sid={session_id} mid={message_id} "
-                        f"missing={missing} cycle={cycle}/{session_listen_cycles}"
-                    )
 
-                # Small pause before selective resend so we do not stomp on the link.
+                print(
+                    f"[SAT][NACK] sid={session_id} missing={missing} "
+                    f"cycle={cycle}/{session_listen_cycles}"
+                )
+
+                # 🔥 lock into selective-only mode
+                seen_nack = True
+
+                # small pause so we don't collide with RX path
                 time.sleep(0.5)
-                resend_missing_chunks(ser, pending_chunks, missing, resend_delay_seconds)
-                time.sleep(1.5)
+
+                # resend ONLY missing chunks
+                resend_missing_chunks(
+                    ser,
+                    pending_chunks,
+                    missing,
+                    resend_delay_seconds,
+                )
+
+                # bigger quiet window after resend
+                time.sleep(2.0)
+
                 continue
 
         return False
 
     # -------------------------------------------------------------
-    # TELEMETRY: standard retry mode
+    # TELEMETRY: leave unchanged
     # -------------------------------------------------------------
     for attempt in range(1, MAX_RETRIES + 1):
         control = read_control_packet(ser, ACK_WAIT_SECONDS)
@@ -319,12 +335,10 @@ def wait_for_ack_or_nack(
             print(f"[SAT][CTRL RX] {control}")
 
         if control is None:
-            if DEBUG_ACKS:
-                print(
-                    f"[SAT][ACK] timeout sid={session_id} mid={message_id} "
-                    f"attempt={attempt}/{MAX_RETRIES}"
-                )
-                print("[SAT] waiting before retry burst")
+            print(
+                f"[SAT][ACK] timeout sid={session_id} mid={message_id} "
+                f"attempt={attempt}/{MAX_RETRIES}"
+            )
 
             time.sleep(1.0)
             send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
@@ -332,32 +346,19 @@ def wait_for_ack_or_nack(
             continue
 
         if not control_matches_session(control, session_id, message_id):
-            if DEBUG_ACKS:
-                print(
-                    f"[SAT][CTRL RX] ignoring control for sid={control.get('sid')} "
-                    f"mid={control.get('mid')}"
-                )
             continue
 
-        control_type = control.get("t")
-
-        if control_type == "ack":
-            if DEBUG_ACKS:
-                print(f"[SAT][ACK] received sid={session_id} mid={message_id}")
+        if control.get("t") == "ack":
+            print(f"[SAT][ACK] received sid={session_id} mid={message_id}")
             return True
 
-        if control_type == "nack":
+        if control.get("t") == "nack":
             missing = control.get("m", [])
-            if DEBUG_ACKS:
-                print(
-                    f"[SAT][NACK] sid={session_id} mid={message_id} "
-                    f"missing={missing} attempt={attempt}/{MAX_RETRIES}"
-                )
+            print(f"[SAT][NACK] sid={session_id} mid={message_id} missing={missing}")
 
             time.sleep(0.5)
             resend_missing_chunks(ser, pending_chunks, missing, resend_delay_seconds)
             time.sleep(1.0)
-            continue
 
     return False
 
