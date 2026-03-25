@@ -1,46 +1,51 @@
 """
 AegisLEO Secure Satellite Telemetry Transmitter
-Chunked RF Version with ACK/NACK Retransmission
+Chunked RF Version with ACK/NACK Retransmission + Compression
 
 Created by: Jamie Grunewald
 Date: 2026-03-24
-Version: v0.8.5
+Version: v0.10.0
 
 Purpose
 -------
 This script runs on the satellite-side node and sends secure telemetry
 to the ground station over the LoRa serial link.
 
-What this version adds
+What this version does
 ----------------------
-This version adds:
+1. Builds signed logical packets
+2. Encrypts telemetry with AES-GCM
+3. Compresses logical packets with zlib
+4. Encodes compressed bytes as base64 text
+5. Splits that text into RF-safe chunks
+6. Frames every transport packet with start/end markers
+7. Waits for ACK/NACK from the ground station
+8. Retransmits as needed
 
-- RF-safe chunking
-- line-based transport packets
-- ACK handling
-- NACK handling
-- selective chunk retransmission
+Why compression matters
+-----------------------
+JSON packets are text-heavy and repetitive.
+Compression shrinks the logical packet before chunking.
 
-Why ACK/NACK matters
---------------------
-LoRa links can lose or delay packets.
+That usually means:
+- fewer RF chunks
+- fewer retransmissions
+- better chance of full delivery over LoRa
 
-So instead of blindly transmitting and hoping for the best, we:
+Why framing matters
+-------------------
+The LoRa serial bridge may:
+- split packets
+- merge packets
+- inject stray bytes
 
-1. send chunk packets
-2. keep a copy of each sent chunk set
-3. wait for ACK from the receiver
-4. if NACK arrives, retransmit only missing chunks
-5. if ACK arrives, clear the sent message from memory
+So we do NOT trust newline boundaries anymore.
 
-Security model
---------------
-This version preserves the logical security model:
-- session_init logical packet is signed
-- telemetry logical packet is signed
-- telemetry payload is encrypted with AES-GCM
+Instead, every transport packet is wrapped like:
 
-Chunking only changes transport format.
+    FRAME_START + JSON_BYTES + FRAME_END
+
+The transmitter also parses ACK/NACK using the same framing.
 """
 
 from __future__ import annotations
@@ -50,6 +55,7 @@ import json
 import random
 import select
 import time
+import zlib
 from typing import Any
 
 import serial
@@ -73,15 +79,19 @@ APID = 100
 CHUNK_SIZE = 32
 CHUNK_DELAY_SECONDS = 0.15
 
-# How long to wait for an ACK after sending a message chunk set
+# ACK/NACK timing
 ACK_WAIT_SECONDS = 2.0
-
-# How many times to retry a message after NACK / timeout
 MAX_RETRIES = 3
 
+# Transport frame markers
+FRAME_START = b"\x7E"   # ~
+FRAME_END = b"\x7F"
+
 # Debug controls
-DEBUG_TX_CHUNKS =False
+DEBUG_TX_CHUNKS = False
 DEBUG_ACKS = True
+DEBUG_BAD_FRAMES = True
+DEBUG_PACKET_SIZES = True
 
 
 # ---------------------------------------------------------------------
@@ -98,15 +108,38 @@ RECEIVER_KEM_PUBLIC_KEY_PATH = "dev_secrets/satellite/receiver_kem_public.key"
 # ---------------------------------------------------------------------
 def packet_to_base64(packet: dict[str, Any]) -> str:
     """
-    Convert one full logical packet into compact JSON bytes, then base64 text.
+    Convert one full logical packet into compact JSON bytes,
+    compress it with zlib, then encode as base64 text.
 
-    Why we do this
+    Flow
+    ----
+    packet dict
+        -> compact JSON bytes
+        -> zlib-compressed bytes
+        -> base64 text
+
+    Why this helps
     --------------
-    The full logical packet may be large and contain many characters.
-    Base64 turns it into safe ASCII text that is easy to split into chunks.
+    LoRa links are much happier when we send fewer bytes.
+    Compression reduces the size before chunking.
     """
     raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-    return base64.b64encode(raw).decode("utf-8")
+    compressed = zlib.compress(raw, level=9)
+    return base64.b64encode(compressed).decode("utf-8")
+
+
+def packet_to_base64_with_stats(packet: dict[str, Any]) -> tuple[str, int, int]:
+    """
+    Same as packet_to_base64(), but also return:
+    - original JSON byte length
+    - compressed byte length
+
+    This is useful for debugging how much compression helps.
+    """
+    raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
+    compressed = zlib.compress(raw, level=9)
+    encoded = base64.b64encode(compressed).decode("utf-8")
+    return encoded, len(raw), len(compressed)
 
 
 def split_chunks(text: str, chunk_size: int) -> list[str]:
@@ -128,11 +161,11 @@ def make_chunk_packets(
 
     Transport chunk packet fields
     -----------------------------
-    t   -> chunk type ("si" or "tc")
+    t   -> chunk type ("si" for session_init, "tc" for telemetry)
     sid -> session ID
     mid -> logical message ID (used for telemetry, omitted for session_init)
     i   -> chunk index
-    n   -> total chunks
+    n   -> total chunk count
     d   -> data fragment
     """
     fragments = split_chunks(encoded_payload, chunk_size)
@@ -156,21 +189,30 @@ def make_chunk_packets(
 
 def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     """
-    Send exactly one small line-based transport packet.
+    Send exactly one framed transport packet.
 
-    Important
-    ---------
-    The LoRa bridge behaved well with newline-delimited transport packets,
-    so every write ends with '\\n'.
+    Framing format
+    --------------
+    FRAME_START + JSON_BYTES + FRAME_END
+
+    Why we do this
+    --------------
+    This gives the receiver hard packet boundaries even if the LoRa serial
+    stream gets noisy or packets are merged together.
     """
-    wire = (json.dumps(pkt, separators=(",", ":")) + "\n").encode("utf-8")
+    payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
+    wire = FRAME_START + payload + FRAME_END
     ser.write(wire)
     ser.flush()
 
 
 def send_chunk_packets(ser: serial.Serial, packets: list[dict[str, Any]]) -> None:
     """
-    Send a whole set of chunk packets with a small delay between each one.
+    Send a whole set of transport chunks with a small delay between each one.
+
+    Why the delay exists
+    --------------------
+    LoRa modules do better when we do not flood them back-to-back.
     """
     total = len(packets)
     for idx, pkt in enumerate(packets):
@@ -183,44 +225,74 @@ def send_chunk_packets(ser: serial.Serial, packets: list[dict[str, Any]]) -> Non
         time.sleep(CHUNK_DELAY_SECONDS)
 
 
-def read_transport_line(ser: serial.Serial, timeout_seconds: float) -> dict[str, Any] | None:
+def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     """
-    Wait briefly for one incoming transport control packet from the receiver.
+    Pull as many complete framed packets as possible out of a byte buffer.
 
-    This function is intentionally defensive because the LoRa serial bridge
-    can occasionally hand us:
-    - non-UTF8 bytes
-    - partial junk
-    - lines that are not valid JSON
+    This is used for incoming ACK/NACK control packets.
+    """
+    frames: list[bytes] = []
 
-    We ignore anything that is not a clean JSON line.
+    while True:
+        start = buffer.find(FRAME_START)
+        if start == -1:
+            # No valid frame start at all. Drop garbage and stop.
+            buffer.clear()
+            break
+
+        # Drop garbage before the next frame start.
+        if start > 0:
+            del buffer[:start]
+
+        end = buffer.find(FRAME_END, 1)
+        if end == -1:
+            # Frame not complete yet. Wait for more bytes.
+            break
+
+        frame = bytes(buffer[1:end])
+        del buffer[:end + 1]
+        frames.append(frame)
+
+    return frames
+
+
+def read_control_packet(ser: serial.Serial, timeout_seconds: float) -> dict[str, Any] | None:
+    """
+    Wait briefly for one framed ACK/NACK control packet.
+
+    Returns
+    -------
+    dict | None
+        Parsed ACK/NACK packet, or None if nothing valid arrives in time.
     """
     end_time = time.time() + timeout_seconds
+    rx_buffer = bytearray()
 
     while time.time() < end_time:
         ready, _, _ = select.select([ser.fileno()], [], [], 0.1)
         if not ready:
             continue
 
-        raw = ser.readline()
+        raw = ser.read(256)
         if not raw:
             continue
 
-        # Decode defensively so one bad byte does not crash the transmitter.
-        text = raw.decode("utf-8", errors="ignore").strip()
+        rx_buffer.extend(raw)
+        frames = extract_framed_packets(rx_buffer)
 
-        # Ignore empty lines or obvious non-JSON lines.
-        if not text or not text.startswith("{") or not text.endswith("}"):
-            continue
+        for frame_bytes in frames:
+            try:
+                text = frame_bytes.decode("utf-8", errors="ignore").strip()
+                if not text:
+                    continue
+                pkt = json.loads(text)
+            except json.JSONDecodeError:
+                if DEBUG_BAD_FRAMES:
+                    print(f"[SAT] WARN: invalid control frame: {frame_bytes[:80]!r}")
+                continue
 
-        try:
-            pkt = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-
-        # Only return recognized control-plane messages.
-        if pkt.get("t") in {"ack", "nack"}:
-            return pkt
+            if pkt.get("t") in {"ack", "nack"}:
+                return pkt
 
     return None
 
@@ -237,13 +309,12 @@ def wait_for_ack_or_nack(
     Policy
     ------
     - session_init (message_id is None):
-        retry the WHOLE message on timeout
-        ignore NACK-based selective retransmit
-    - telemetry (message_id is an int):
-        allow selective retransmission using bounded NACK lists
+      resend the whole message on timeout/NACK
+    - telemetry:
+      selectively resend missing chunk indexes when NACK arrives
     """
     for attempt in range(1, MAX_RETRIES + 1):
-        control = read_transport_line(ser, ACK_WAIT_SECONDS)
+        control = read_control_packet(ser, ACK_WAIT_SECONDS)
 
         if control is None:
             if DEBUG_ACKS:
@@ -268,7 +339,7 @@ def wait_for_ack_or_nack(
             return True
 
         if control_type == "nack":
-            # For session_init, ignore selective NACK and just resend all on next loop
+            # session_init: resend whole thing
             if message_id is None:
                 if DEBUG_ACKS:
                     print(
@@ -278,6 +349,7 @@ def wait_for_ack_or_nack(
                 send_chunk_packets(ser, pending_chunks)
                 continue
 
+            # telemetry: resend only missing indexes
             missing = control.get("m", [])
             if DEBUG_ACKS:
                 print(
@@ -321,7 +393,7 @@ kem_ciphertext = initiator_handshake.kem_ciphertext
 # ---------------------------------------------------------------------
 # Open serial interface to the LoRa radio
 # ---------------------------------------------------------------------
-ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.2)
 
 # Logical telemetry sequence counter
 sequence = 1
@@ -342,7 +414,7 @@ print("Press Ctrl+C to stop.")
 # ---------------------------------------------------------------------
 # Send session_init once
 # ---------------------------------------------------------------------
-# Step 1: Build unsigned session_init core
+# Step 1: Build logical session_init core
 session_init_core = {
     "type": "session_init",
     "spacecraft_id": SPACECRAFT_ID,
@@ -350,7 +422,7 @@ session_init_core = {
     "kem_ciphertext": b64e(kem_ciphertext),
 }
 
-# Step 2: Sign session_init logical packet
+# Step 2: Sign the logical session_init packet
 session_init_signature = sign(
     canonical_json_bytes(session_init_core),
     MLDSA_SECRET_KEY,
@@ -363,10 +435,18 @@ session_init_packet = {
     "signature": b64e(session_init_signature),
 }
 
-# Step 4: Convert to base64 text for chunking
-session_init_b64 = packet_to_base64(session_init_packet)
+# Step 4: Compress + base64 encode for chunking
+session_init_b64, session_init_raw_len, session_init_comp_len = packet_to_base64_with_stats(
+    session_init_packet
+)
 
-# Step 5: Build RF transport chunks
+if DEBUG_PACKET_SIZES:
+    print(
+        f"[SAT] session_init sizes raw={session_init_raw_len} "
+        f"compressed={session_init_comp_len}"
+    )
+
+# Step 5: Split into RF-safe chunks
 session_init_chunks = make_chunk_packets(
     chunk_type="si",
     session_id=session.session_id,
@@ -375,7 +455,7 @@ session_init_chunks = make_chunk_packets(
     message_id=None,
 )
 
-# Step 6: Send all chunks
+# Step 6: Send chunks
 send_chunk_packets(ser, session_init_chunks)
 
 print(
@@ -383,7 +463,7 @@ print(
     f"({len(session_init_chunks)} chunks)"
 )
 
-# Step 7: Wait for ACK/NACK from receiver
+# Step 7: Wait for ACK/NACK
 session_init_ok = wait_for_ack_or_nack(
     ser=ser,
     session_id=session.session_id,
@@ -396,8 +476,6 @@ if not session_init_ok:
     raise SystemExit(1)
 
 print("[SAT] session_init acknowledged by ground station")
-
-# Small pause so ground station can finish session setup
 time.sleep(1)
 
 
@@ -406,7 +484,7 @@ time.sleep(1)
 # ---------------------------------------------------------------------
 while True:
     # -------------------------------------------------------------
-    # Step 1: Create simulated telemetry values
+    # Step 1: Generate simulated telemetry
     # -------------------------------------------------------------
     payload = {
         "temp_c": round(random.uniform(11.5, 15.5), 2),
@@ -426,12 +504,12 @@ while True:
     )
 
     # -------------------------------------------------------------
-    # Step 3: Convert frame into deterministic bytes
+    # Step 3: Convert frame to deterministic bytes
     # -------------------------------------------------------------
     frame_bytes = canonical_json_bytes(frame)
 
     # -------------------------------------------------------------
-    # Step 4: Encrypt telemetry frame with AES-GCM
+    # Step 4: Encrypt frame using AES-GCM session key
     # -------------------------------------------------------------
     encrypted = encrypt(
         frame_bytes,
@@ -440,7 +518,7 @@ while True:
     )
 
     # -------------------------------------------------------------
-    # Step 5: Build unsigned telemetry logical packet
+    # Step 5: Build logical telemetry packet
     # -------------------------------------------------------------
     packet_core = {
         "type": "telemetry",
@@ -459,21 +537,20 @@ while True:
         algorithm=MLDSA_ALGORITHM,
     )
 
-    # -------------------------------------------------------------
-    # Step 7: Build final logical telemetry packet
-    # -------------------------------------------------------------
     transmitted_packet = {
         **packet_core,
         "signature": b64e(telemetry_signature),
     }
 
     # -------------------------------------------------------------
-    # Step 8: Convert full logical telemetry packet to base64 text
+    # Step 7: Compress + base64 encode for chunking
     # -------------------------------------------------------------
-    telemetry_b64 = packet_to_base64(transmitted_packet)
+    telemetry_b64, telemetry_raw_len, telemetry_comp_len = packet_to_base64_with_stats(
+        transmitted_packet
+    )
 
     # -------------------------------------------------------------
-    # Step 9: Split logical telemetry packet into RF-safe chunks
+    # Step 8: Split telemetry into RF-safe chunks
     # -------------------------------------------------------------
     telemetry_chunks = make_chunk_packets(
         chunk_type="tc",
@@ -484,18 +561,27 @@ while True:
     )
 
     # -------------------------------------------------------------
-    # Step 10: Send telemetry chunks
+    # Step 9: Send telemetry chunks
     # -------------------------------------------------------------
     send_chunk_packets(ser, telemetry_chunks)
 
-    print(
-        f"[SAT] TX secure packet "
-        f"session={session.session_id} seq={sequence} "
-        f"chunks={len(telemetry_chunks)} payload={payload}"
-    )
+    if DEBUG_PACKET_SIZES:
+        print(
+            f"[SAT] TX secure packet "
+            f"session={session.session_id} seq={sequence} "
+            f"chunks={len(telemetry_chunks)} "
+            f"raw={telemetry_raw_len} compressed={telemetry_comp_len} "
+            f"payload={payload}"
+        )
+    else:
+        print(
+            f"[SAT] TX secure packet "
+            f"session={session.session_id} seq={sequence} "
+            f"chunks={len(telemetry_chunks)} payload={payload}"
+        )
 
     # -------------------------------------------------------------
-    # Step 11: Wait for ACK/NACK
+    # Step 10: Wait for ACK/NACK
     # -------------------------------------------------------------
     delivery_ok = wait_for_ack_or_nack(
         ser=ser,
@@ -508,7 +594,7 @@ while True:
         print(f"[SAT] ERROR: telemetry seq={sequence} failed after retries")
 
     # -------------------------------------------------------------
-    # Step 12: Move to next telemetry message
+    # Step 11: Move to next telemetry packet
     # -------------------------------------------------------------
     sequence += 1
     time.sleep(3)
