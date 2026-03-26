@@ -39,7 +39,7 @@ SPACECRAFT_ID = "AegisLEO-SAT-1"
 APID = 100
 
 SESSION_INIT_CHUNK_SIZE = 220
-TELEMETRY_CHUNK_SIZE = 180
+TELEMETRY_CHUNK_SIZE = 140
 
 SESSION_INIT_CHUNK_DELAY_SECONDS = 0.80
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
@@ -125,15 +125,55 @@ def send_chunk_packets(
     packets: list[dict[str, Any]],
     delay_seconds: float,
 ) -> None:
+    """
+    Send transport chunks one at a time.
+
+    Why this function exists
+    ------------------------
+    LoRa is half-duplex and slow compared to normal network links.
+    If we blast chunks too quickly, the receiver can fall behind,
+    framing can drift, and we end up in NACK/retry storms.
+
+    What we do here
+    ---------------
+    - Send each chunk
+    - Add a small random delay (jitter) so timing is not perfectly rigid
+    - For telemetry only, slow down more and pause every few chunks
+      so the receiver has time to process what it already got
+    """
     total = len(packets)
+
     for idx, pkt in enumerate(packets):
         write_transport_packet(ser, pkt)
+
         if DEBUG_TX_CHUNKS:
             print(
                 f"[SAT][CHUNK] t={pkt['t']} sid={pkt['sid']} "
                 f"mid={pkt.get('mid')} idx={idx + 1}/{total}"
             )
-        time.sleep(delay_seconds + random.uniform(0.005, 0.02))
+
+        # ---------------------------------------------------------
+        # Telemetry pacing
+        # ---------------------------------------------------------
+        # "tc" = telemetry chunk
+        #
+        # Telemetry is currently overwhelming the receiver, so we:
+        # 1. send it slower than session_init
+        # 2. add a tiny pause every few chunks
+        if pkt["t"] == "tc":
+            # Every 5 telemetry chunks, pause briefly to let the
+            # receiver catch up and reduce framing pressure.
+            if idx > 0 and idx % 5 == 0:
+                time.sleep(0.25)
+
+            # Slow telemetry down more than session_init.
+            # We use the caller's delay as a base, then multiply it.
+            time.sleep((delay_seconds * 2.5) + random.uniform(0.005, 0.02))
+
+        else:
+            # Non-telemetry path, mainly session_init ("si")
+            # Keep your existing lighter pacing here.
+            time.sleep(delay_seconds + random.uniform(0.005, 0.02))
 
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
