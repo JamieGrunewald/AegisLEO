@@ -41,7 +41,7 @@ APID = 100
 SESSION_INIT_CHUNK_SIZE = 220
 TELEMETRY_CHUNK_SIZE = 180
 
-SESSION_INIT_CHUNK_DELAY_SECONDS = 0.80
+SESSION_INIT_CHUNK_DELAY_SECONDS = 1.05
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
 
 ACK_WAIT_SECONDS = 15.0
@@ -132,10 +132,19 @@ def send_chunk_packets(
                 f"mid={pkt.get('mid')} idx={idx + 1}/{total}"
             )
         #time.sleep(delay_seconds)
-        time.sleep(delay_seconds + random.uniform(0.01, 0.05))
+        time.sleep(delay_seconds + random.uniform(0.005, 0.02))
 
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
+    """
+    Extract length-prefixed frames from the serial buffer.
+
+    Frame format:
+    [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
+
+    This is transmitter-side helper logic for any local frame extraction use.
+    It no longer uses the old delimiter-only parsing model.
+    """
     frames: list[bytes] = []
 
     while True:
@@ -147,27 +156,40 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
         if start > 0:
             del buffer[:start]
 
-        end = buffer.find(FRAME_END, 1)
-        if end == -1:
-            if len(buffer) > MAX_CONTROL_FRAME_JSON_BYTES + 2:
-                del buffer[0]
+        # Need start marker + 4-byte length
+        if len(buffer) < 1 + 4:
             break
 
-        frame = bytes(buffer[1:end])
-        del buffer[:end + 1]
-
-        if not frame:
+        if buffer[0:1] != FRAME_START:
+            del buffer[0]
             continue
 
-        if len(frame) > MAX_CONTROL_FRAME_JSON_BYTES:
+        payload_len = int.from_bytes(buffer[1:5], "big")
+
+        if payload_len <= 0 or payload_len > 4096:
             if DEBUG_BAD_FRAMES:
-                print(f"[SAT] WARN: oversized control frame dropped ({len(frame)} bytes)")
+                print(f"[SAT] WARN: invalid frame length {payload_len}, dropping 1 byte to resync")
+            del buffer[0]
             continue
 
-        frames.append(frame)
+        total_len = 1 + 4 + payload_len + 1
+
+        if len(buffer) < total_len:
+            break
+
+        payload = bytes(buffer[5:5 + payload_len])
+        end_marker = buffer[5 + payload_len:5 + payload_len + 1]
+
+        if end_marker != FRAME_END:
+            if DEBUG_BAD_FRAMES:
+                print(f"[SAT] WARN: bad frame end marker {end_marker!r}, dropping 1 byte to resync")
+            del buffer[0]
+            continue
+
+        del buffer[:total_len]
+        frames.append(payload)
 
     return frames
-
 
 def read_control_packet(ser: serial.Serial, timeout: float) -> dict | None:
     """
@@ -176,7 +198,6 @@ def read_control_packet(ser: serial.Serial, timeout: float) -> dict | None:
     Frame format:
     [START][LEN][JSON][END]
     """
-
     buffer = bytearray()
     start_time = time.time()
 
@@ -185,47 +206,25 @@ def read_control_packet(ser: serial.Serial, timeout: float) -> dict | None:
         if chunk:
             buffer.extend(chunk)
 
-        # Need at least START + LEN
-        if len(buffer) < 1 + 4:
-            continue
+        frames = extract_framed_packets(buffer)
 
-        start = buffer.find(FRAME_START)
-        if start == -1:
-            buffer.clear()
-            continue
+        for payload in frames:
+            try:
+                pkt = json.loads(payload.decode("utf-8"))
+            except UnicodeDecodeError:
+                if DEBUG_BAD_FRAMES:
+                    print(f"[SAT] WARN: non-UTF8 control frame dropped: {payload[:80]!r}")
+                continue
+            except json.JSONDecodeError:
+                if DEBUG_BAD_FRAMES:
+                    print(f"[SAT] WARN: invalid control JSON dropped: {payload[:80]!r}")
+                continue
 
-        if start > 0:
-            del buffer[:start]
-
-        if len(buffer) < 1 + 4:
-            continue
-
-        payload_len = int.from_bytes(buffer[1:5], "big")
-
-        if payload_len <= 0 or payload_len > 4096:
-            del buffer[0]
-            continue
-
-        full_len = 1 + 4 + payload_len + 1
-
-        if len(buffer) < full_len:
-            continue
-
-        payload = buffer[5:5 + payload_len]
-        end_marker = buffer[5 + payload_len:5 + payload_len + 1]
-
-        if end_marker != FRAME_END:
-            del buffer[0]
-            continue
-
-        del buffer[:full_len]
-
-        try:
-            return json.loads(payload.decode("utf-8"))
-        except Exception:
-            continue
+            if pkt.get("t") in {"ack", "nack"}:
+                return pkt
 
     return None
+
 
 def resend_missing_chunks(
     ser: serial.Serial,
@@ -289,7 +288,7 @@ def wait_for_ack_or_nack(
                     )
 
                 # 🚫 BEFORE NACK: occasional resend-all (rare)
-                if not seen_nack and cycle % 4 == 0:
+                if not seen_nack and cycle in {6, 10}:
                     print("[SAT] pre-NACK recovery burst (rare resend-all)")
                     time.sleep(3.0)
                     send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
@@ -457,8 +456,9 @@ print(
     f"({len(session_init_chunks)} chunks)"
 )
 
-# Quiet window for control-plane response after the burst.
-time.sleep(1.0)
+# Give the half-duplex link time to flip from TX to RX cleanly.
+time.sleep(2.5)
+
 
 session_init_ok = wait_for_ack_or_nack(
     ser=ser,
