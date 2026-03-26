@@ -41,7 +41,7 @@ APID = 100
 SESSION_INIT_CHUNK_SIZE = 220
 TELEMETRY_CHUNK_SIZE = 180
 
-SESSION_INIT_CHUNK_DELAY_SECONDS = 0.65
+SESSION_INIT_CHUNK_DELAY_SECONDS = 0.80
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
 
 ACK_WAIT_SECONDS = 15.0
@@ -131,7 +131,8 @@ def send_chunk_packets(
                 f"[SAT][CHUNK] t={pkt['t']} sid={pkt['sid']} "
                 f"mid={pkt.get('mid')} idx={idx + 1}/{total}"
             )
-        time.sleep(delay_seconds)
+        #time.sleep(delay_seconds)
+        time.sleep(delay_seconds + random.uniform(0.01, 0.05))
 
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
