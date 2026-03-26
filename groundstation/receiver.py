@@ -474,7 +474,7 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
 
         # Need at least:
         # 1 byte FRAME_START + 4 byte length field
-        if len(buffer) < 5:
+        if len(buffer) < 1 + FRAME_LEN_BYTES:
             break
 
         if buffer[0:1] != FRAME_START:
