@@ -265,7 +265,7 @@ def wait_for_ack_or_nack(
     # SESSION INIT: listen-first selective recovery
     # -------------------------------------------------------------
     if message_id is None:
-        session_listen_cycles = 12
+        session_listen_cycles = 16
         seen_nack = False
 
         for cycle in range(1, session_listen_cycles + 1):
