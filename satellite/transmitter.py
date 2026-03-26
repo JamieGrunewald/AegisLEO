@@ -41,7 +41,7 @@ APID = 100
 SESSION_INIT_CHUNK_SIZE = 220
 TELEMETRY_CHUNK_SIZE = 180
 
-SESSION_INIT_CHUNK_DELAY_SECONDS = 1.05
+SESSION_INIT_CHUNK_DELAY_SECONDS = 0.80
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
 
 ACK_WAIT_SECONDS = 15.0
@@ -108,10 +108,14 @@ def make_chunk_packets(
 
 
 def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
+    """
+    Send one transport packet using the same length-prefixed framing
+    the receiver expects.
+
+    Frame format:
+        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
+    """
     payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
-    
-    #wire = FRAME_START + payload + FRAME_END
-    
     length = len(payload).to_bytes(4, "big")
     wire = FRAME_START + length + payload + FRAME_END
     ser.write(wire)
@@ -131,7 +135,6 @@ def send_chunk_packets(
                 f"[SAT][CHUNK] t={pkt['t']} sid={pkt['sid']} "
                 f"mid={pkt.get('mid')} idx={idx + 1}/{total}"
             )
-        #time.sleep(delay_seconds)
         time.sleep(delay_seconds + random.uniform(0.005, 0.02))
 
 
@@ -140,15 +143,13 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     Extract length-prefixed frames from the serial buffer.
 
     Frame format:
-    [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
-
-    This is transmitter-side helper logic for any local frame extraction use.
-    It no longer uses the old delimiter-only parsing model.
+        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
     """
     frames: list[bytes] = []
 
     while True:
         start = buffer.find(FRAME_START)
+
         if start == -1:
             buffer.clear()
             break
@@ -156,8 +157,7 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
         if start > 0:
             del buffer[:start]
 
-        # Need start marker + 4-byte length
-        if len(buffer) < 1 + 4:
+        if len(buffer) < 5:
             break
 
         if buffer[0:1] != FRAME_START:
@@ -188,41 +188,44 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
 
         del buffer[:total_len]
         frames.append(payload)
-
     return frames
 
-def read_control_packet(ser: serial.Serial, timeout: float) -> dict | None:
+def read_control_packet(ser: serial.Serial,  timeout_seconds: float) -> dict[str, Any] | None:
     """
-    Read one length-prefixed control packet.
-
-    Frame format:
-    [START][LEN][JSON][END]
+    Read one ACK/NACK control packet using the new length-prefixed framing.
     """
-    buffer = bytearray()
-    start_time = time.time()
+    end_time = time.time() + timeout_seconds
+    rx_buffer = bytearray()
 
-    while time.time() - start_time < timeout:
-        chunk = ser.read(512)
-        if chunk:
-            buffer.extend(chunk)
+    while time.time() < end_time:
+        ready, _, _ = select.select([ser.fileno()], [], [], 0.2)
+        if not ready:
+            continue
 
-        frames = extract_framed_packets(buffer)
+        raw = ser.read(512)
+        if not raw:
+            continue
 
-        for payload in frames:
+        rx_buffer.extend(raw)
+        frames = extract_framed_packets(rx_buffer)
+
+        for frame_bytes in frames:
             try:
-                pkt = json.loads(payload.decode("utf-8"))
+                text = frame_bytes.decode("utf-8").strip()
+                if not text:
+                    continue
+                pkt = json.loads(text)
             except UnicodeDecodeError:
                 if DEBUG_BAD_FRAMES:
-                    print(f"[SAT] WARN: non-UTF8 control frame dropped: {payload[:80]!r}")
+                    print(f"[SAT] WARN: non-UTF8 control frame dropped: {frame_bytes[:80]!r}")
                 continue
             except json.JSONDecodeError:
                 if DEBUG_BAD_FRAMES:
-                    print(f"[SAT] WARN: invalid control JSON dropped: {payload[:80]!r}")
+                    print(f"[SAT] WARN: invalid control JSON dropped: {frame_bytes[:80]!r}")
                 continue
 
             if pkt.get("t") in {"ack", "nack"}:
                 return pkt
-
     return None
 
 
@@ -256,20 +259,16 @@ def wait_for_ack_or_nack(
     resend_delay_seconds: float,
 ) -> bool:
     """
-    Improved session_init recovery logic:
-
-    Key behavior:
-    - Listen FIRST
-    - After first NACK -> switch to selective-only mode
-    - Never resend full burst again after NACK
+    session_init gets a quieter, listen-first recovery loop.
+    telemetry keeps a simpler retry model.
     """
 
     # -------------------------------------------------------------
-    # SESSION INIT: selective-lock recovery mode
+    # SESSION INIT: listen-first selective recovery
     # -------------------------------------------------------------
     if message_id is None:
         session_listen_cycles = 12
-        seen_nack = False  # 🔥 critical new state
+        seen_nack = False
 
         for cycle in range(1, session_listen_cycles + 1):
             control = read_control_packet(ser, ACK_WAIT_SECONDS)
@@ -277,29 +276,21 @@ def wait_for_ack_or_nack(
             if control is not None:
                 print(f"[SAT][CTRL RX] {control}")
 
-            # -----------------------------------------------------
-            # NOTHING RECEIVED
-            # -----------------------------------------------------
             if control is None:
-                if DEBUG_ACKS:
-                    print(
-                        f"[SAT][ACK] session_init quiet timeout "
-                        f"sid={session_id} cycle={cycle}/{session_listen_cycles}"
-                    )
+                print(
+                    f"[SAT][ACK] session_init quiet timeout "
+                    f"sid={session_id} cycle={cycle}/{session_listen_cycles}"
+                )
 
-                # 🚫 BEFORE NACK: occasional resend-all (rare)
+                # Before the first valid NACK, allow only rare resend-all nudges.
                 if not seen_nack and cycle in {6, 10}:
                     print("[SAT] pre-NACK recovery burst (rare resend-all)")
-                    time.sleep(3.0)
+                    time.sleep(2.5)
                     send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
-                    time.sleep(3.0)
+                    time.sleep(2.5)
 
-                # ✅ AFTER NACK: DO NOTHING (listen only)
                 continue
 
-            # -----------------------------------------------------
-            # FILTER WRONG SESSION
-            # -----------------------------------------------------
             if not control_matches_session(control, session_id, message_id):
                 if DEBUG_ACKS:
                     print(
@@ -310,47 +301,32 @@ def wait_for_ack_or_nack(
 
             control_type = control.get("t")
 
-            # -----------------------------------------------------
-            # ACK
-            # -----------------------------------------------------
             if control_type == "ack":
                 print(f"[SAT][ACK] received sid={session_id}")
                 return True
 
-            # -----------------------------------------------------
-            # NACK (THIS IS THE IMPORTANT PATH)
-            # -----------------------------------------------------
             if control_type == "nack":
                 missing = control.get("m", [])
-
                 print(
                     f"[SAT][NACK] sid={session_id} missing={missing} "
                     f"cycle={cycle}/{session_listen_cycles}"
                 )
 
-                # 🔥 lock into selective-only mode
                 seen_nack = True
-
-                # small pause so we don't collide with RX path
                 time.sleep(0.5)
-
-                # resend ONLY missing chunks
                 resend_missing_chunks(
                     ser,
                     pending_chunks,
                     missing,
                     resend_delay_seconds,
                 )
-
-                # bigger quiet window after resend
                 time.sleep(4.0)
-
                 continue
 
         return False
 
     # -------------------------------------------------------------
-    # TELEMETRY: leave unchanged
+    # TELEMETRY: simpler retry model
     # -------------------------------------------------------------
     for attempt in range(1, MAX_RETRIES + 1):
         control = read_control_packet(ser, ACK_WAIT_SECONDS)
@@ -363,7 +339,6 @@ def wait_for_ack_or_nack(
                 f"[SAT][ACK] timeout sid={session_id} mid={message_id} "
                 f"attempt={attempt}/{MAX_RETRIES}"
             )
-
             time.sleep(1.0)
             send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
             time.sleep(1.0)
@@ -379,10 +354,10 @@ def wait_for_ack_or_nack(
         if control.get("t") == "nack":
             missing = control.get("m", [])
             print(f"[SAT][NACK] sid={session_id} mid={message_id} missing={missing}")
-
             time.sleep(0.5)
             resend_missing_chunks(ser, pending_chunks, missing, resend_delay_seconds)
             time.sleep(1.0)
+
 
     return False
 
