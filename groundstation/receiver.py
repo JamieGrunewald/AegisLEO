@@ -312,6 +312,17 @@ def cleanup_reassembly_buffers() -> None:
                 f"have={len(buf.parts)}/{buf.total_chunks} missing_count={len(missing)}"
             )
 
+            if len(missing) <= 10:
+                print(
+                    f"[GROUND][RECOVERY] sid={session_id} mid={message_id} "
+                    f"remaining_missing={missing}"
+                )
+            else:
+                print(
+                    f"[GROUND][RECOVERY] sid={session_id} mid={message_id} "
+                    f"remaining_missing_count={len(missing)}"
+                )
+
         send_nack(session_id=session_id, message_id=message_id, missing=missing)
 
         new_buf = ChunkAssembly(total_chunks=buf.total_chunks)
@@ -515,13 +526,16 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
             # Count framing failures so the stats line reflects reality.
             STATS["frames_bad_end_marker"] += 1
 
-            if DEBUG_BAD_FRAMES:
+            # Only print every 10th framing warning to keep logs readable.
+            # We still count every failure in STATS.
+            if DEBUG_BAD_FRAMES and STATS["frames_bad_end_marker"] % 10 == 0:
                 print(
                     f"[GROUND] WARN: bad frame end marker {end_marker!r}, "
+                    f"count={STATS['frames_bad_end_marker']} "
                     "dropping 1 byte to resync"
                 )
 
-            # Drop one byte and hunt for the next valid FRAME_START.
+            # Drop one byte and search for the next valid frame start.
             del buffer[0]
             continue
 
