@@ -238,11 +238,14 @@ def print_stats() -> None:
 
 def write_framed_packet(pkt: dict[str, Any]) -> None:
     """
-    Send one ACK/NACK control packet using the same length-prefixed framing
-    that the transmitter now expects.
+    Send one ACK/NACK control packet back to the satellite using
+    the length-prefixed framing format.
+
+    Frame format:
+        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
     """
     payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
-    length = len(payload).to_bytes(FRAME_LEN_BYTES, "big")
+    length = len(payload).to_bytes(4, "big")
     wire = FRAME_START + length + payload + FRAME_END
     ser.write(wire)
     ser.flush()
@@ -449,17 +452,13 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     """
     Extract length-prefixed frames from the raw serial buffer.
 
-    New frame format
-    ----------------
-    FRAME_START (1 byte)
-    LENGTH      (4 bytes, big-endian)
-    PAYLOAD     (LENGTH bytes)
-    FRAME_END   (1 byte)
+    Frame format:
+        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
 
-    Why this is safer
-    -----------------
-    The receiver no longer has to guess where JSON ends.
-    It knows exactly how many payload bytes belong to the frame.
+    Why this works better
+    ---------------------
+    We do not search blindly for FRAME_END anymore.
+    We trust the 4-byte payload length, then verify the final end marker.
     """
     frames: list[bytes] = []
 
@@ -467,55 +466,48 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
         start = buffer.find(FRAME_START)
 
         if start == -1:
-            # No frame start at all. Drop garbage and stop.
             buffer.clear()
             break
 
         if start > 0:
-            # Drop garbage before FRAME_START.
             del buffer[:start]
 
         # Need at least:
-        # 1 byte start + 4 bytes length
-        if len(buffer) < 1 + FRAME_LEN_BYTES:
+        # 1 byte FRAME_START + 4 byte length field
+        if len(buffer) < 5:
             break
 
-        payload_len = int.from_bytes(buffer[1:1 + FRAME_LEN_BYTES], "big")
+        if buffer[0:1] != FRAME_START:
+            del buffer[0]
+            continue
+
+        payload_len = int.from_bytes(buffer[1:5], "big")
 
         if payload_len <= 0 or payload_len > MAX_FRAME_JSON_BYTES:
-            STATS["frames_bad_length"] += 1
             if DEBUG_BAD_FRAMES:
                 print(f"[GROUND] WARN: invalid frame length {payload_len}, dropping 1 byte to resync")
             del buffer[0]
             continue
 
-        full_frame_len = 1 + FRAME_LEN_BYTES + payload_len + 1
+        total_len = 1 + 4 + payload_len + 1  # start + len + payload + end
 
-        # Not enough bytes yet for the full frame. Wait for more data.
-        if len(buffer) < full_frame_len:
+        if len(buffer) < total_len:
+            # Incomplete frame, wait for more bytes.
             break
 
-        payload_start = 1 + FRAME_LEN_BYTES
-        payload_end = payload_start + payload_len
-        payload = bytes(buffer[payload_start:payload_end])
+        payload = bytes(buffer[5:5 + payload_len])
+        end_marker = buffer[5 + payload_len:5 + payload_len + 1]
 
-        end_marker = buffer[payload_end:payload_end + 1]
         if end_marker != FRAME_END:
-            STATS["frames_bad_end_marker"] += 1
             if DEBUG_BAD_FRAMES:
-                print(
-                    f"[GROUND] WARN: bad frame end marker {end_marker!r}, "
-                    "dropping 1 byte to resync"
-                )
+                print(f"[GROUND] WARN: bad frame end marker {end_marker!r}, dropping 1 byte to resync")
             del buffer[0]
             continue
 
-        # Full valid frame extracted.
-        del buffer[:full_frame_len]
+        del buffer[:total_len]
         frames.append(payload)
 
     return frames
-
 
 # ---------------------------------------------------------------------
 # Main receive loop
