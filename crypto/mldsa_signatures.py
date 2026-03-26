@@ -1,38 +1,30 @@
 """
-AegisLEO ML-DSA Signature Utilities
+AegisLEO ML-DSA Signature Utilities (Noob-Friendly Version)
 
 Created by: Jamie Grunewald
-Date: 2026-03-08
-Version: v0.3.1
+Version: v0.4.0
 
 Purpose
 -------
-This file wraps ML-DSA signing and verification using liboqs Python bindings.
+This file handles digital signatures using ML-DSA (post-quantum).
 
-What ML-DSA does
+Why this matters
 ----------------
-ML-DSA is the post-quantum digital signature standard from FIPS 204.
+We want to guarantee:
+- The satellite really sent this data (authenticity)
+- The data was not modified (integrity)
+- Attackers cannot forge packets (non-repudiation)
 
-It helps us answer:
-- Did this packet really come from the satellite?
-- Was the packet modified?
-- Can an attacker forge packets without the secret signing key?
-
-In simple terms
----------------
+How it works (simple view)
+--------------------------
 Satellite:
-    signs packet with private key
+    signs message with PRIVATE key
 
 Ground station:
-    verifies signature with public key
+    verifies message with PUBLIC key
 
-If the signature fails:
-    reject packet
-
-Important note
---------------
-This module depends on the 'oqs' Python package and the underlying liboqs
-library being installed correctly.
+If verification fails:
+    reject the packet immediately
 """
 
 from __future__ import annotations
@@ -44,58 +36,76 @@ import oqs
 
 
 # ---------------------------------------------------------------------
-# Default ML-DSA algorithm
+# COMPATIBILITY LAYER (VERY IMPORTANT)
 # ---------------------------------------------------------------------
-# Common choices:
-# - ML-DSA-44
-# - ML-DSA-65
-# - ML-DSA-87
-#
-# We are using ML-DSA-65 as a middle-ground demo choice.
+def _get_signature_class():
+    """
+    Different versions of the oqs Python library expose the Signature class
+    in different places.
+
+    Some environments:
+        oqs.Signature
+
+    Others:
+        oqs.oqs.Signature
+
+    This function finds the correct one dynamically so our code works everywhere.
+    """
+    # Case 1: direct access
+    if hasattr(oqs, "Signature"):
+        return oqs.Signature
+
+    # Case 2: nested access
+    if hasattr(oqs, "oqs") and hasattr(oqs.oqs, "Signature"):
+        return oqs.oqs.Signature
+
+    # If neither exists, we cannot proceed
+    raise RuntimeError("No compatible oqs Signature class found")
+
+
+# Store the correct class once so we don't check repeatedly
+SignatureClass = _get_signature_class()
+
+
+# ---------------------------------------------------------------------
+# DEFAULT ALGORITHM
+# ---------------------------------------------------------------------
 DEFAULT_SIG_ALG = "ML-DSA-65"
 
 
+# ---------------------------------------------------------------------
+# KEYPAIR STRUCTURE
+# ---------------------------------------------------------------------
 @dataclass
 class SignatureKeypair:
     """
-    Simple container for a generated keypair.
+    Simple container for keys.
 
-    Fields
-    ------
-    algorithm : str
-        Name of the ML-DSA algorithm used.
+    public_key:
+        Share this with the receiver
 
-    public_key : bytes
-        The public key. Safe to distribute to verifiers.
-
-    secret_key : bytes
-        The private/secret key. Must be protected.
+    secret_key:
+        Keep this safe on the satellite ONLY
     """
     algorithm: str
     public_key: bytes
     secret_key: bytes
 
 
+# ---------------------------------------------------------------------
+# KEY GENERATION
+# ---------------------------------------------------------------------
 def generate_keypair(algorithm: str = DEFAULT_SIG_ALG) -> SignatureKeypair:
     """
     Generate a new ML-DSA keypair.
 
-    Parameters
-    ----------
-    algorithm : str
-        Signature algorithm name supported by liboqs.
-
-    Returns
-    -------
-    SignatureKeypair
-        Object containing algorithm, public key, and secret key.
+    This would typically be done once and saved to disk.
     """
-    # Create a signer object for the selected algorithm
-    with oqs.Signature(algorithm) as signer:
-        # generate_keypair() returns the public key
+    with SignatureClass(algorithm) as signer:
+        # Generates BOTH keys internally
         public_key = signer.generate_keypair()
 
-        # export_secret_key() gives us the private key bytes
+        # Export private key (must be protected)
         secret_key = signer.export_secret_key()
 
     return SignatureKeypair(
@@ -105,33 +115,24 @@ def generate_keypair(algorithm: str = DEFAULT_SIG_ALG) -> SignatureKeypair:
     )
 
 
+# ---------------------------------------------------------------------
+# SIGNING
+# ---------------------------------------------------------------------
 def sign(message: bytes, secret_key: bytes, algorithm: str = DEFAULT_SIG_ALG) -> bytes:
     """
-    Sign a message using the ML-DSA secret key.
+    Sign a message using the private key.
 
-    Parameters
-    ----------
-    message : bytes
-        Exact byte sequence to sign.
-        This should be deterministic and stable. That is why we use
-        canonical JSON serialization before signing.
-
-    secret_key : bytes
-        Private signing key.
-
-    algorithm : str
-        Signature algorithm name.
-
-    Returns
-    -------
-    bytes
-        Signature bytes.
+    IMPORTANT:
+    - Message MUST be deterministic (we use canonical JSON)
+    - Same input must always produce the same signature verification result
     """
-    # Create signer using the provided secret key
-    with oqs.Signature(algorithm, secret_key) as signer:
+    with SignatureClass(algorithm, secret_key) as signer:
         return signer.sign(message)
 
 
+# ---------------------------------------------------------------------
+# VERIFICATION
+# ---------------------------------------------------------------------
 def verify(
     message: bytes,
     signature: bytes,
@@ -141,50 +142,35 @@ def verify(
     """
     Verify a signature using the public key.
 
-    Parameters
-    ----------
-    message : bytes
-        Original message bytes that were signed.
+    Returns:
+        True  -> valid signature
+        False -> invalid or error
 
-    signature : bytes
-        Signature to verify.
-
-    public_key : bytes
-        Public key corresponding to the satellite private key.
-
-    algorithm : str
-        Signature algorithm name.
-
-    Returns
-    -------
-    bool
-        True if signature is valid, otherwise False.
+    We wrap this in try/except because different oqs versions
+    may throw slightly different exceptions.
     """
-    # Create verifier object
-    with oqs.Signature(algorithm) as verifier:
-        return verifier.verify(message, signature, public_key)
+    try:
+        with SignatureClass(algorithm) as verifier:
+            return verifier.verify(message, signature, public_key)
+
+    except Exception as e:
+        # We NEVER crash the pipeline on signature failure
+        print(f"[CRYPTO] verify error: {e}")
+        return False
 
 
+# ---------------------------------------------------------------------
+# BASE64 HELPERS
+# ---------------------------------------------------------------------
 def b64e(data: bytes) -> str:
     """
-    Base64-encode binary data into text.
-
-    Why we need this
-    ----------------
-    JSON cannot safely carry raw binary bytes.
-    So we convert:
-        bytes -> base64 text
-
-    This is useful for:
-    - nonce
-    - ciphertext
-    - signatures
+    Convert raw bytes → safe string for JSON transport.
     """
     return base64.b64encode(data).decode("ascii")
 
 
 def b64d(data: str) -> bytes:
     """
-    Decode base64 text back into raw bytes.
+    Convert base64 string → raw bytes.
     """
     return base64.b64decode(data.encode("ascii"))
