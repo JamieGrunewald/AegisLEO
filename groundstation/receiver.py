@@ -85,6 +85,9 @@ SESSION_INIT_TTL_SECONDS = 25
 
 MAX_MISSING_PER_NACK = 24
 
+DEBUG_SHOW_CIPHERTEXT = True
+CIPHERTEXT_PREVIEW_LEN = 96
+
 DEBUG_CHUNKS = True
 DEBUG_REASSEMBLY = True
 DEBUG_ACKS = True
@@ -666,7 +669,34 @@ while True:
                     print(f"[GROUND] REJECTED: session expired ({session_id})")
                     send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
+                
+                # ---------------------------------------------------------
+                # Optional demo/debug view: show encrypted telemetry before decryption
+                # ---------------------------------------------------------
+                # This does NOT add any traffic to the LoRa link.
+                # We are only printing data that the receiver already received.
+                #
+                # Why this is useful:
+                # - proves the payload is arriving encrypted
+                # - shows the nonce used for AES-GCM
+                # - makes demos and conference screenshots much clearer
+                if DEBUG_SHOW_CIPHERTEXT:
+                    ciphertext_b64 = packet["ciphertext"]
+                    nonce_b64 = packet["nonce"]
 
+                    print("-" * 72)
+                    print("Encrypted Telemetry View (before decrypt)")
+                    print("Algorithms : Session key via ML-KEM-1024 | Payload encrypted with AES-GCM | Packet signed with ML-DSA-65")
+                    print(f"Session ID  : {packet['session_id']}")
+                    print(f"Nonce       : {nonce_b64}")
+                    print(f"Nonce len   : {len(nonce_b64)} base64 chars")
+                    print(
+                        f"Ciphertext  : {ciphertext_b64[:CIPHERTEXT_PREVIEW_LEN]}"
+                        f"{'...' if len(ciphertext_b64) > CIPHERTEXT_PREVIEW_LEN else ''}"
+                    )
+                    print(f"CT length   : {len(ciphertext_b64)} base64 chars")
+                    print("-" * 72)
+                    
                 plaintext = decrypt(
                     b64d(packet["nonce"]),
                     b64d(packet["ciphertext"]),
