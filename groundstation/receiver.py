@@ -453,15 +453,25 @@ def add_transport_chunk(packet: dict[str, Any]) -> tuple[str, int | None, str] |
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     """
-    Extract length-prefixed frames from the raw serial buffer.
+    Extract complete length-prefixed frames from the raw serial buffer.
 
-    Frame format:
-        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
+    Frame format
+    ------------
+    [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
 
-    Why this works better
+    Why this parser exists
+    ----------------------
+    LoRa/serial links can split, merge, or corrupt bytes. We therefore:
+    - discard garbage before FRAME_START
+    - require the 4-byte payload length field
+    - wait until the full frame is present
+    - verify FRAME_END before accepting the payload
+    - drop 1 byte and resync if framing looks wrong
+
+    Important design rule
     ---------------------
-    We do not search blindly for FRAME_END anymore.
-    We trust the 4-byte payload length, then verify the final end marker.
+    We trust the payload length more than blind delimiter searching.
+    That gives us more stable recovery on noisy links.
     """
     frames: list[bytes] = []
 
@@ -502,8 +512,16 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
         end_marker = buffer[5 + payload_len:5 + payload_len + 1]
 
         if end_marker != FRAME_END:
+            # Count framing failures so the stats line reflects reality.
+            STATS["frames_bad_end_marker"] += 1
+
             if DEBUG_BAD_FRAMES:
-                print(f"[GROUND] WARN: bad frame end marker {end_marker!r}, dropping 1 byte to resync")
+                print(
+                    f"[GROUND] WARN: bad frame end marker {end_marker!r}, "
+                    "dropping 1 byte to resync"
+                )
+
+            # Drop one byte and hunt for the next valid FRAME_START.
             del buffer[0]
             continue
 
@@ -533,6 +551,16 @@ while True:
             STATS["frames_total"] += 1
 
             try:
+                # Quick sanity check:
+                # all transport packets should be JSON objects, so the raw
+                # payload should begin with "{". If not, the frame is almost
+                # certainly misaligned or corrupted.
+                if not frame_bytes.startswith(b"{"):
+                    if DEBUG_BAD_FRAMES:
+                        print(f"[GROUND] WARN: non-JSON frame dropped: {frame_bytes[:80]!r}")
+                    STATS["frames_json_fail"] += 1
+                    continue
+
                 text = frame_bytes.decode("utf-8").strip()
                 if not text:
                     continue
@@ -670,16 +698,27 @@ while True:
                     send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
                 
-                # ---------------------------------------------------------
-                # Optional demo/debug view: show encrypted telemetry before decryption
-                # ---------------------------------------------------------
-                # This does NOT add any traffic to the LoRa link.
-                # We are only printing data that the receiver already received.
-                #
-                # Why this is useful:
-                # - proves the payload is arriving encrypted
-                # - shows the nonce used for AES-GCM
-                # - makes demos and conference screenshots much clearer
+                """
+                Extract complete length-prefixed frames from the raw serial buffer.
+
+                Frame format
+                ------------
+                [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
+
+                Why this parser exists
+                ----------------------
+                LoRa/serial links can split, merge, or corrupt bytes. We therefore:
+                - discard garbage before FRAME_START
+                - require the 4-byte payload length field
+                - wait until the full frame is present
+                - verify FRAME_END before accepting the payload
+                - drop 1 byte and resync if framing looks wrong
+
+                Important design rule
+                ---------------------
+                We trust the payload length more than blind delimiter searching.
+                That gives us more stable recovery on noisy links.
+                """
                 if DEBUG_SHOW_CIPHERTEXT:
                     ciphertext_b64 = packet["ciphertext"]
                     nonce_b64 = packet["nonce"]
@@ -736,6 +775,7 @@ while True:
                 print(f"Gap        : {gap}")
                 print(f"Replay     : ACCEPTED ({decision.reason})")
                 print("Crypto     : signature=VALID, session=ACTIVE, decrypt=SUCCESS")
+                print("Proof      : ciphertext shown above, plaintext shown below after AES-GCM decrypt")
 
                 if detection.is_anomalous:
                     print(
