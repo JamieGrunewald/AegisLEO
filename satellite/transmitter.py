@@ -53,7 +53,7 @@ SESSION_INIT_CHUNK_SIZE = 220
 TELEMETRY_CHUNK_SIZE = 140
 
 SESSION_INIT_CHUNK_DELAY_SECONDS = 0.80
-TELEMETRY_CHUNK_DELAY_SECONDS = 0.08
+TELEMETRY_CHUNK_DELAY_SECONDS = 0.12
 
 ACK_WAIT_SECONDS = 15.0
 MAX_RETRIES = 6
@@ -197,7 +197,7 @@ def send_chunk_packets(
         if pkt["t"] == "tc":
             # Brief processing gap every few telemetry chunks.
             if idx > 0 and idx % 5 == 0:
-                time.sleep(0.25)
+                time.sleep(0.35)
 
             time.sleep((delay_seconds * 2.5) + random.uniform(0.005, 0.02))
         else:
