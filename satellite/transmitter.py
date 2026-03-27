@@ -16,6 +16,9 @@ v0.11.2 patch notes
 """
 
 from __future__ import annotations
+from common import telemetry
+from common.demo_log import dlog, banner, section, kv
+from common.telemetry import Telemetry, sample_telemetry
 
 import base64
 import json
@@ -456,10 +459,15 @@ session_init_chunks = make_chunk_packets(
 )
 
 if DEBUG_PACKET_SIZES:
-    print(
-        f"[SAT] session_init sizes raw={session_init_raw_len} "
-        f"compressed={session_init_comp_len} encoded={session_init_enc_len} "
-        f"chunks={len(session_init_chunks)} chunk_size={SESSION_INIT_CHUNK_SIZE}"
+    dlog(
+        "SAT",
+        "SESSION_INIT",
+        "Prepared secure session-init packet",
+        raw=session_init_raw_len,
+        compressed=session_init_comp_len,
+        encoded=session_init_enc_len,
+        chunks=len(session_init_chunks),
+        chunk_size=SESSION_INIT_CHUNK_SIZE,
     )
 
 send_chunk_packets(ser, session_init_chunks, SESSION_INIT_CHUNK_DELAY_SECONDS)
@@ -496,6 +504,14 @@ while True:
         "state": random.choice(["NOMINAL", "SUNPOINT", "TX_WINDOW"]),
     }
 
+    dlog(
+        "SAT",
+        "TELEMETRY_BUILD",
+        "Generated telemetry sample",
+        seq=telemetry.seq,
+        summary=telemetry.summary(),
+    )
+    
     frame = build_frame(
         spacecraft_id=SPACECRAFT_ID,
         sequence=sequence,
@@ -545,14 +561,13 @@ while True:
     send_chunk_packets(ser, telemetry_chunks, TELEMETRY_CHUNK_DELAY_SECONDS)
 
     if DEBUG_PACKET_SIZES:
-        print(
-            f"[SAT] TX secure packet "
-            f"session={session.session_id} seq={sequence} "
-            f"chunks={len(telemetry_chunks)} "
-            f"raw={telemetry_raw_len} compressed={telemetry_comp_len} "
-            f"encoded={telemetry_enc_len} chunk_size={TELEMETRY_CHUNK_SIZE} "
-            f"payload={payload}"
-        )
+        dlog(
+            "SAT",
+            "SESSION_INIT_TX",
+            "Sent session-init to ground station",
+            session=session.session_id,
+            chunks=len(session_init_chunks),
+            )
 
     time.sleep(1.0)
 
