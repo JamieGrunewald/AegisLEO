@@ -4,6 +4,10 @@ WORKDIR /workspace
 
 COPY . /workspace
 
-RUN pip install --no-cache-dir -r requirements.txt pyserial
+# Install only the runtime dependencies needed by the receiver
+RUN pip install --no-cache-dir -r requirements.runtime.txt
+
+# Install local liboqs-python bindings from the repo
+RUN pip install --no-cache-dir ./third_party/liboqs-python
 
 CMD ["bash"]
