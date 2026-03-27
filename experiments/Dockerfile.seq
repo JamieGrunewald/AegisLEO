@@ -13,32 +13,19 @@ RUN apt-get update && apt-get install -y \
 
 RUN pip install --no-cache-dir -r requirements.runtime.txt
 
-# Build liboqs
 RUN cd /workspace/liboqs && \
     mkdir -p build && \
     cd build && \
     cmake -GNinja .. && \
     ninja && \
-    ninja install
-
-# Fix linker paths
-RUN echo "/usr/local/lib" >> /etc/ld.so.conf.d/liboqs.conf && \
+    ninja install && \
+    cp -av lib/liboqs.so* /usr/local/lib/ && \
+    echo "/usr/local/lib" >> /etc/ld.so.conf.d/liboqs.conf && \
     echo "/usr/local/lib64" >> /etc/ld.so.conf.d/liboqs.conf && \
     ldconfig
 
-# 🔥 THIS FIXES YOUR ISSUE
-RUN ln -sf /usr/local/lib/liboqs.so.0 /usr/local/lib/liboqs.so || true
-
-
-# 🔥 Force linker to know about liboqs
-RUN echo "/usr/local/lib" >> /etc/ld.so.conf.d/liboqs.conf && \
-    echo "/usr/local/lib64" >> /etc/ld.so.conf.d/liboqs.conf && \
-    ldconfig
-
-# 🔥 Ensure runtime visibility
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:$LD_LIBRARY_PATH
 
-# Install Python bindings
 RUN pip install --no-cache-dir liboqs-python
 
 CMD ["bash"]
