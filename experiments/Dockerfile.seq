@@ -19,7 +19,7 @@ RUN cd /workspace/liboqs && \
     cmake -GNinja .. && \
     ninja && \
     ninja install && \
-    cp -av lib/liboqs.so* /usr/local/lib/ && \
+    cp -av /workspace/liboqs/build/lib/liboqs.so* /usr/local/lib/
     echo "/usr/local/lib" >> /etc/ld.so.conf.d/liboqs.conf && \
     echo "/usr/local/lib64" >> /etc/ld.so.conf.d/liboqs.conf && \
     ldconfig
