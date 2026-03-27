@@ -50,3 +50,24 @@ Thumbs.db
 # Third Party
 # ------------------------
 third_party/liboqs-python/.git
+
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs / runtime data
+groundstation/logs/
+*.csv
+
+# ML artifacts
+models/*.keras
+models/*.pkl
+models/*.json
+
+# Secrets
+dev_secrets/
+keys/
+
+# Temp / cleanup
+_cleanup_quarantine_*/
