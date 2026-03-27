@@ -4,15 +4,15 @@ Transport-Hardened RF Version with Selective session_init Recovery
 
 Created by: Jamie Grunewald
 Date: 2026-03-26
-Version: v0.12.0
+Version: v0.13.0
 
-What changed in v0.12.0
+What changed in v0.13.0
 -----------------------
-1. Fixed telemetry object usage in the main TX loop
-2. Standardized startup and TX logging with dlog/banner/kv
-3. Corrected telemetry packet-size debug logging
-4. Added clearer comments for learning and stage-demo readability
-5. Kept transport behavior the same to avoid destabilizing the working baseline
+1. Added progress-aware telemetry recovery
+2. Increased patience for lossy-link telemetry delivery
+3. Reduced premature give-up behavior on late NACK/ACK cycles
+4. Kept one telemetry message in flight at a time
+5. Preserved existing crypto + transport framing behavior
 """
 
 from __future__ import annotations
@@ -56,7 +56,13 @@ SESSION_INIT_CHUNK_DELAY_SECONDS = 0.80
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.12
 
 ACK_WAIT_SECONDS = 15.0
-MAX_RETRIES = 6
+
+# Session-init and telemetry need different patience profiles.
+SESSION_INIT_LISTEN_CYCLES = 16
+
+# Telemetry on this lossy link clearly needs more breathing room.
+TELEMETRY_MAX_CYCLES = 14
+TELEMETRY_MAX_QUIET_CYCLES = 3
 
 # ---------------------------------------------------------------------
 # Framing markers used over the serial link
@@ -192,8 +198,6 @@ def send_chunk_packets(
                 idx=f"{idx + 1}/{total}",
             )
 
-        # Telemetry gets gentler pacing than session init because it is
-        # the repeated data path and can otherwise overwhelm RX.
         if pkt["t"] == "tc":
             # Brief processing gap every few telemetry chunks.
             if idx > 0 and idx % 5 == 0:
@@ -332,97 +336,18 @@ def control_matches_session(control: dict[str, Any], session_id: str, message_id
     return control_mid == message_id
 
 
-def wait_for_ack_or_nack(
+def wait_for_session_init_ack_or_nack(
     ser: serial.Serial,
     session_id: str,
-    message_id: int | None,
     pending_chunks: list[dict[str, Any]],
     resend_delay_seconds: float,
 ) -> bool:
     """
-    Wait for ACK/NACK and selectively recover missing chunks.
-
-    Behavior differs slightly by message type:
-    - session_init: quieter, listen-first recovery loop
-    - telemetry: simpler retry loop
+    Wait for session-init ACK/NACK and selectively recover missing chunks.
     """
+    seen_nack = False
 
-    # -------------------------------------------------------------
-    # SESSION INIT PATH
-    # -------------------------------------------------------------
-    if message_id is None:
-        session_listen_cycles = 16
-        seen_nack = False
-
-        for cycle in range(1, session_listen_cycles + 1):
-            control = read_control_packet(ser, ACK_WAIT_SECONDS)
-
-            if control is not None and DEBUG_ACKS:
-                dlog("SAT", "CTRL_RX", "Received control packet", pkt=control)
-
-            if control is None:
-                dlog(
-                    "SAT",
-                    "ACK_WAIT",
-                    "Session-init quiet timeout",
-                    sid=session_id,
-                    cycle=f"{cycle}/{session_listen_cycles}",
-                )
-
-                # Rare nudge resends before the first valid NACK.
-                if not seen_nack and cycle in {6, 10}:
-                    dlog("SAT", "RECOVERY", "Pre-NACK resend-all burst", sid=session_id)
-                    time.sleep(2.5)
-                    send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
-                    time.sleep(2.5)
-
-                continue
-
-            if not control_matches_session(control, session_id, message_id):
-                if DEBUG_ACKS:
-                    dlog(
-                        "SAT",
-                        "CTRL_IGNORE",
-                        "Ignoring control for different session/message",
-                        sid=control.get("sid"),
-                        mid=control.get("mid"),
-                    )
-                continue
-
-            control_type = control.get("t")
-
-            if control_type == "ack":
-                dlog("SAT", "ACK", "Session-init acknowledged", sid=session_id)
-                return True
-
-            if control_type == "nack":
-                missing = control.get("m", [])
-                dlog(
-                    "SAT",
-                    "NACK",
-                    "Session-init missing chunks reported",
-                    sid=session_id,
-                    missing=missing,
-                    cycle=f"{cycle}/{session_listen_cycles}",
-                )
-
-                seen_nack = True
-                time.sleep(0.5)
-                resend_missing_chunks(
-                    ser=ser,
-                    pending_chunks=pending_chunks,
-                    missing=missing,
-                    delay_seconds=resend_delay_seconds,
-                )
-                time.sleep(4.0)
-                continue
-
-        return False
-
-    # -------------------------------------------------------------
-    # TELEMETRY PATH
-    # -------------------------------------------------------------
-    for attempt in range(1, MAX_RETRIES + 1):
+    for cycle in range(1, SESSION_INIT_LISTEN_CYCLES + 1):
         control = read_control_packet(ser, ACK_WAIT_SECONDS)
 
         if control is not None and DEBUG_ACKS:
@@ -432,14 +357,112 @@ def wait_for_ack_or_nack(
             dlog(
                 "SAT",
                 "ACK_WAIT",
-                "Telemetry ACK timeout",
+                "Session-init quiet timeout",
+                sid=session_id,
+                cycle=f"{cycle}/{SESSION_INIT_LISTEN_CYCLES}",
+            )
+
+            # Rare nudge resends before the first valid NACK.
+            if not seen_nack and cycle in {6, 10}:
+                dlog("SAT", "RECOVERY", "Pre-NACK resend-all burst", sid=session_id)
+                time.sleep(2.5)
+                send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
+                time.sleep(2.5)
+
+            continue
+
+        if not control_matches_session(control, session_id, None):
+            if DEBUG_ACKS:
+                dlog(
+                    "SAT",
+                    "CTRL_IGNORE",
+                    "Ignoring control for different session/message",
+                    sid=control.get("sid"),
+                    mid=control.get("mid"),
+                )
+            continue
+
+        control_type = control.get("t")
+
+        if control_type == "ack":
+            dlog("SAT", "ACK", "Session-init acknowledged", sid=session_id)
+            return True
+
+        if control_type == "nack":
+            missing = control.get("m", [])
+            dlog(
+                "SAT",
+                "NACK",
+                "Session-init missing chunks reported",
+                sid=session_id,
+                missing=missing,
+                cycle=f"{cycle}/{SESSION_INIT_LISTEN_CYCLES}",
+            )
+
+            seen_nack = True
+            time.sleep(0.5)
+            resend_missing_chunks(
+                ser=ser,
+                pending_chunks=pending_chunks,
+                missing=missing,
+                delay_seconds=resend_delay_seconds,
+            )
+            time.sleep(4.0)
+
+    return False
+
+
+def wait_for_telemetry_ack_or_nack(
+    ser: serial.Serial,
+    session_id: str,
+    message_id: int,
+    pending_chunks: list[dict[str, Any]],
+    resend_delay_seconds: float,
+) -> bool:
+    """
+    Progress-aware telemetry recovery loop.
+
+    Key idea:
+    - If the receiver's missing set keeps shrinking, recovery is working.
+    - Do not abandon the message too early just because the link is slow.
+    - Only one telemetry message is in flight at a time.
+    """
+    quiet_cycles = 0
+    last_missing_set: set[int] | None = None
+
+    for cycle in range(1, TELEMETRY_MAX_CYCLES + 1):
+        control = read_control_packet(ser, ACK_WAIT_SECONDS)
+
+        if control is not None and DEBUG_ACKS:
+            dlog("SAT", "CTRL_RX", "Received control packet", pkt=control)
+
+        if control is None:
+            quiet_cycles += 1
+
+            dlog(
+                "SAT",
+                "ACK_WAIT",
+                "Telemetry quiet timeout",
                 sid=session_id,
                 mid=message_id,
-                attempt=f"{attempt}/{MAX_RETRIES}",
+                cycle=f"{cycle}/{TELEMETRY_MAX_CYCLES}",
+                quiet=quiet_cycles,
             )
-            time.sleep(1.0)
-            send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
-            time.sleep(1.0)
+
+            # Do not immediately blast the full packet again on first silence.
+            # Give the receiver a little room to issue a targeted NACK.
+            if quiet_cycles >= TELEMETRY_MAX_QUIET_CYCLES:
+                dlog(
+                    "SAT",
+                    "RECOVERY",
+                    "Repeated quiet timeout, resending full telemetry packet",
+                    sid=session_id,
+                    mid=message_id,
+                )
+                send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
+                quiet_cycles = 0
+                time.sleep(1.0)
+
             continue
 
         if not control_matches_session(control, session_id, message_id):
@@ -453,28 +476,65 @@ def wait_for_ack_or_nack(
                 )
             continue
 
-        if control.get("t") == "ack":
+        quiet_cycles = 0
+        control_type = control.get("t")
+
+        if control_type == "ack":
             dlog("SAT", "ACK", "Telemetry acknowledged", sid=session_id, mid=message_id)
             return True
 
-        if control.get("t") == "nack":
-            missing = control.get("m", [])
+        if control_type != "nack":
+            continue
+
+        missing = control.get("m", [])
+        missing_set = set(int(x) for x in missing)
+
+        dlog(
+            "SAT",
+            "NACK",
+            "Telemetry missing chunks reported",
+            sid=session_id,
+            mid=message_id,
+            missing=missing,
+            cycle=f"{cycle}/{TELEMETRY_MAX_CYCLES}",
+        )
+
+        # Track whether the receiver is making progress.
+        if last_missing_set is None:
             dlog(
                 "SAT",
-                "NACK",
-                "Telemetry missing chunks reported",
+                "RECOVERY",
+                "Initial telemetry recovery map received",
                 sid=session_id,
                 mid=message_id,
-                missing=missing,
+                missing_count=len(missing_set),
             )
-            time.sleep(0.5)
-            resend_missing_chunks(
-                ser=ser,
-                pending_chunks=pending_chunks,
-                missing=missing,
-                delay_seconds=resend_delay_seconds,
+        else:
+            improvement = len(last_missing_set) - len(missing_set)
+            dlog(
+                "SAT",
+                "RECOVERY",
+                "Telemetry recovery progress",
+                sid=session_id,
+                mid=message_id,
+                previous_missing=len(last_missing_set),
+                current_missing=len(missing_set),
+                improvement=improvement,
             )
-            time.sleep(1.0)
+
+        last_missing_set = missing_set
+
+        time.sleep(0.5)
+        resend_missing_chunks(
+            ser=ser,
+            pending_chunks=pending_chunks,
+            missing=missing,
+            delay_seconds=resend_delay_seconds,
+        )
+
+        # Slightly longer wait after resend gives the receiver time
+        # to ingest the correction burst and answer cleanly.
+        time.sleep(1.5)
 
     return False
 
@@ -568,10 +628,9 @@ dlog(
 # Give the half-duplex link time to flip from TX to RX cleanly.
 time.sleep(2.5)
 
-session_init_ok = wait_for_ack_or_nack(
+session_init_ok = wait_for_session_init_ack_or_nack(
     ser=ser,
     session_id=session.session_id,
-    message_id=None,
     pending_chunks=session_init_chunks,
     resend_delay_seconds=SESSION_INIT_CHUNK_DELAY_SECONDS,
 )
@@ -659,6 +718,7 @@ while True:
         message_id=sequence,
     )
 
+    # Only one telemetry message is in flight at a time.
     send_chunk_packets(ser, telemetry_chunks, TELEMETRY_CHUNK_DELAY_SECONDS)
 
     if DEBUG_PACKET_SIZES:
@@ -675,10 +735,9 @@ while True:
             chunk_size=TELEMETRY_CHUNK_SIZE,
         )
 
-    # Short pause before listening for ACK/NACK response.
     time.sleep(1.0)
 
-    delivery_ok = wait_for_ack_or_nack(
+    delivery_ok = wait_for_telemetry_ack_or_nack(
         ser=ser,
         session_id=session.session_id,
         message_id=sequence,
@@ -687,7 +746,12 @@ while True:
     )
 
     if not delivery_ok:
-        dlog("SAT", "DELIVERY_FAIL", "Telemetry delivery failed after retries", seq=sequence)
+        dlog(
+            "SAT",
+            "DELIVERY_FAIL",
+            "Telemetry delivery failed after recovery window",
+            seq=sequence,
+        )
     else:
         dlog("SAT", "DELIVERY_OK", "Telemetry acknowledged by ground station", seq=sequence)
 
