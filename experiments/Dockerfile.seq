@@ -4,17 +4,6 @@ WORKDIR /workspace
 
 COPY . /workspace
 
-# Install full project dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Ensure runtime-specific extras (safe redundancy)
-#RUN pip install --no-cache-dir \
-RUN pip install --no-cache-dir pyserial \
-    pandas \
-    scikit-learn \
-    joblib \
-    tqdm\
-    pyserial\
-    cryptography
+RUN pip install --no-cache-dir -r requirements.txt pyserial
 
 CMD ["bash"]
