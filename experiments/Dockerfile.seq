@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/l4t-pytorch:r36.2.0-pth2.2-py3
+FROM nvcr.io/nvidia/pytorch:25.05-py3-igpu
 
 WORKDIR /workspace
 
