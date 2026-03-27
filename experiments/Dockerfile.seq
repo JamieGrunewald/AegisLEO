@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir \
     pandas \
     scikit-learn \
     joblib \
-    tqdm
-
+    tqdm\
+    pyserial
+    
 CMD ["bash"]
