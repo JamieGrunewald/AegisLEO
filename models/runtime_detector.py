@@ -1,121 +1,154 @@
-"""
-AegisLEO Runtime Detector
-
-Created by: Jamie Grunewald
-Date: 2026-03-23
-Version: v0.1.0
-
-Purpose
--------
-Provide a lightweight runtime anomaly-detection interface for live telemetry.
-
-Why this file exists
---------------------
-This module is designed to sit in the ground-station receive path after:
-- signature verification
-- AES-GCM decryption
-- frame parsing
-- replay protection
-
-For now, it uses a simple rule-based scoring method as a placeholder.
-Later, this same interface can be backed by an autoencoder or another ML model
-without changing the receiver's call pattern.
-"""
-
 from __future__ import annotations
 
+"""
+AegisLEO Phase 5 - Runtime Sequence Detector
+
+What this does:
+- Loads the trained sequence autoencoder
+- Keeps a rolling window of recent telemetry feature vectors
+- Reconstructs that window using the trained model
+- Computes reconstruction error
+- Flags anomaly if score > saved threshold
+"""
+
+import json
+from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+
+import torch
+import torch.nn as nn
 
 
-@dataclass(frozen=True)
+# Must match training script
+WINDOW_SIZE = 16
+MODEL_PATH = Path("models/seq_autoencoder.pt")
+THRESHOLD_PATH = Path("models/seq_threshold.json")
+
+
+@dataclass
 class DetectionResult:
-    """
-    Result of runtime anomaly evaluation.
-    """
-
     is_anomalous: bool
     score: float
-    threshold: float
     reasons: list[str]
 
 
-def extract_features(frame: dict[str, Any]) -> dict[str, float]:
+class SeqAutoencoder(nn.Module):
     """
-    Extract a small numeric feature set from a parsed telemetry frame.
-
-    Expected payload example
-    ------------------------
-    {
-        "temp_c": 12.3,
-        "bus_v": 5.01,
-        "bus_i": 0.42,
-        "state": "NOMINAL"
-    }
+    Same model architecture used during training.
+    Must match exactly or the saved weights will not load.
     """
-    payload = frame.get("payload", {})
 
-    return {
-        "temp_c": float(payload.get("temp_c", 0.0)),
-        "bus_v": float(payload.get("bus_v", 0.0)),
-        "bus_i": float(payload.get("bus_i", 0.0)),
-        "sequence": float(frame.get("sequence", 0)),
-        "apid": float(frame.get("apid", 0)),
-    }
+    def __init__(self, features: int):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Linear(features, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, features),
+        )
+
+    def forward(self, x):
+        z = self.encoder(x)
+        out = self.decoder(z)
+        return out
 
 
 class RuntimeDetector:
     """
-    Lightweight runtime detector.
+    Runtime anomaly detector for live telemetry.
 
-    Current behavior
-    ----------------
-    Uses a simple rule-based anomaly score as a placeholder:
-    - temperature outside expected range
-    - bus voltage outside expected range
-    - bus current outside expected range
-    - non-NOMINAL state
-
-    Later this class can be upgraded to load a trained ML model while keeping
-    the same public `detect()` method.
+    Behavior:
+    - If model is not loaded yet, returns a safe nominal placeholder
+    - If window is not full yet, returns warming_up
+    - Once window is full, computes real anomaly score
     """
 
-    def __init__(self, threshold: float = 1.0) -> None:
-        self.threshold = threshold
+    def __init__(self):
+        self.ready = False
+        self.threshold = None
+        self.window: deque[list[float]] = deque(maxlen=WINDOW_SIZE)
 
-    def detect(self, frame: dict[str, Any]) -> DetectionResult:
+        # Runtime inference can stay on CPU for now.
+        # Training used GPU. Live inference for this small model is light.
+        self.device = "cpu"
+
+        try:
+            if not MODEL_PATH.exists():
+                raise FileNotFoundError(f"Missing model file: {MODEL_PATH}")
+
+            if not THRESHOLD_PATH.exists():
+                raise FileNotFoundError(f"Missing threshold file: {THRESHOLD_PATH}")
+
+            # Load threshold
+            with open(THRESHOLD_PATH, "r") as f:
+                cfg = json.load(f)
+
+            self.threshold = float(cfg["threshold"])
+
+            # Feature count must match telemetry.to_feature_vector()
+            self.model = SeqAutoencoder(features=11).to(self.device)
+
+            state_dict = torch.load(MODEL_PATH, map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            self.model.eval()
+
+            self.ready = True
+
+        except Exception as exc:
+            print(f"[ML] RuntimeDetector init failed: {exc}", flush=True)
+            self.ready = False
+
+    def detect(self, telemetry) -> DetectionResult:
         """
-        Evaluate a telemetry frame and return anomaly result.
+        Score one live telemetry object.
+
+        telemetry must provide:
+        - to_feature_vector()
+        - validate_envelope()
         """
-        payload = frame.get("payload", {})
-        features = extract_features(frame)
 
-        score = 0.0
-        reasons: list[str] = []
+        # Convert live telemetry object into numeric feature vector
+        features = list(telemetry.to_feature_vector())
+        self.window.append(features)
 
-        temp_c = features["temp_c"]
-        if temp_c < -40.0 or temp_c > 85.0:
-            score += 1.0
-            reasons.append("temperature_out_of_range")
+        # Model not loaded yet
+        if not self.ready:
+            return DetectionResult(
+                is_anomalous=False,
+                score=0.0,
+                reasons=["model_not_loaded"],
+            )
 
-        bus_v = features["bus_v"]
-        if bus_v < 4.5 or bus_v > 5.5:
-            score += 1.0
-            reasons.append("bus_voltage_out_of_range")
+        # Need enough history before we can score a sequence
+        if len(self.window) < WINDOW_SIZE:
+            return DetectionResult(
+                is_anomalous=False,
+                score=0.0,
+                reasons=["warming_up"],
+            )
 
-        bus_i = features["bus_i"]
-        if bus_i < 0.0 or bus_i > 2.0:
-            score += 1.0
-            reasons.append("bus_current_out_of_range")
+        # Build one input tensor shaped like:
+        # (batch=1, window_size, features)
+        x = torch.tensor([list(self.window)], dtype=torch.float32, device=self.device)
 
-        state = str(payload.get("state", "UNKNOWN"))
-        if state != "NOMINAL":
-            score += 0.5
-            reasons.append(f"state_not_nominal:{state}")
+        with torch.no_grad():
+            pred = self.model(x)
+            error = torch.mean((x - pred) ** 2).item()
+
+        is_anomalous = error > self.threshold
+
+        # Add human-readable reasons for stage output
+        reasons = telemetry.validate_envelope()
 
         return DetectionResult(
-            is_anomalous=score >= self.threshold,
-            score=score,
-            threshold=self.threshold,
+            is_anomalous=is_anomalous,
+            score=error,
             reasons=reasons,
         )

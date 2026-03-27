@@ -808,7 +808,8 @@ while True:
                 
                 feature_logger.log(telemetry.to_feature_dict())
 
-                detection = detector.detect(frame)
+                detection = detector.detect(telemetry)
+                
 
                 print("=" * 72)
                 print("AegisLEO Secure Telemetry Packet")

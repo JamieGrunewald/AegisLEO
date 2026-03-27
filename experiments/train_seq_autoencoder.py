@@ -137,7 +137,7 @@ def main():
     loss_fn = nn.MSELoss()
 
     # ============================
-    # 🔁 Training loop
+    # Training loop
     # ============================
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.MSELoss()
@@ -159,7 +159,7 @@ def main():
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += loss.item().item()
 
             # Free batch refs quickly on Jetson
             del batch_x, pred, loss
