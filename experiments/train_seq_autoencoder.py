@@ -7,8 +7,9 @@ import os
 
 from window_dataset import build_windows
 
+DATA_PATH = "groundstation/logs/_generated_telemetry.csv"
+#DATA_PATH = "groundstation/logs/telemetry_normal.csv"
 
-DATA_PATH = "groundstation/logs/telemetry_normal.csv"
 MODEL_PATH = "models/seq_autoencoder.pt"
 THRESHOLD_PATH = "models/seq_threshold.json"
 
