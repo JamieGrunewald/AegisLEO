@@ -1,6 +1,5 @@
 FROM nvcr.io/nvidia/pytorch:25.05-py3-igpu
 
-ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 WORKDIR /workspace
 
 COPY . /workspace
@@ -12,10 +11,9 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install only the runtime deps you actually need
 RUN pip install --no-cache-dir -r requirements.runtime.txt
 
-# Build and install liboqs (the C library)
+# Build liboqs
 RUN cd /workspace/liboqs && \
     mkdir -p build && \
     cd build && \
@@ -24,7 +22,10 @@ RUN cd /workspace/liboqs && \
     ninja install && \
     ldconfig
 
-# Install the Python wrapper that provides "import oqs"
+# 🔥 THIS IS THE KEY LINE
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+
+# Install Python bindings
 RUN pip install --no-cache-dir liboqs-python
 
 CMD ["bash"]
