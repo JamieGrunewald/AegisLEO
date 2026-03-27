@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir \
     scikit-learn \
     joblib \
     tqdm\
-    pyserial
-    
+    pyserial\
+    cryptography
+
 CMD ["bash"]
