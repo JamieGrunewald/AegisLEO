@@ -43,6 +43,9 @@ class SeqAutoencoder(nn.Module):
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    if device == "cuda":
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    print(model)
 
     X = build_windows(DATA_PATH, WINDOW_SIZE)
 

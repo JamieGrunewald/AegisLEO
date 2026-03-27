@@ -64,6 +64,10 @@ from crypto.key_manager import KeyManager
 from crypto.mldsa_signatures import verify, b64d
 from groundstation.replay_window import ReplayWindow
 from models.runtime_detector import RuntimeDetector
+from groundstation.feature_logger import FeatureLogger
+
+detector = RuntimeDetector()
+feature_logger = FeatureLogger("groundstation/logs/telemetry_normal.csv")
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -472,6 +476,7 @@ def add_transport_chunk(packet: dict[str, Any]) -> tuple[str, int | None, str] |
 
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
+    
     """
     Extract complete length-prefixed frames from the raw serial buffer.
 
@@ -786,6 +791,23 @@ while True:
                 if previous_max != -1 and sequence > previous_max + 1:
                     gap = sequence - previous_max - 1
 
+                payload = frame["payload"]
+
+                telemetry = Telemetry(
+                    seq=sequence,
+                    timestamp=float(frame["timestamp"]),
+                    temperature_c=float(payload["temp_c"]),
+                    battery_pct=int(payload.get("battery_pct", 100)),
+                    mode=str(payload["state"]),
+                    latitude=float(payload.get("latitude", 0.0)),
+                    longitude=float(payload.get("longitude", 0.0)),
+                    altitude_km=float(payload.get("altitude_km", 0.0)),
+                    bus_v=float(payload["bus_v"]),
+                    bus_i=float(payload["bus_i"]),
+                )
+                
+                feature_logger.log(telemetry.to_feature_dict())
+
                 detection = detector.detect(frame)
 
                 print("=" * 72)
@@ -808,16 +830,24 @@ while True:
                 else:
                     print(f"ML         : nominal (score={detection.score})")
 
-                payload = frame["payload"]
-                print(
-                    f"Payload    : temp_c={payload['temp_c']} "
-                    f"bus_v={payload['bus_v']} "
-                    f"bus_i={payload['bus_i']} "
-                    f"state={payload['state']}"
-                )
+                print(f"Summary    : {telemetry.summary()}")
                 print("=" * 72)
 
                 send_ack(session_id, message_id)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
             except Exception as exc:
                 print(
