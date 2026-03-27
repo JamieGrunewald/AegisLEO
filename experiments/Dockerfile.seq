@@ -21,6 +21,15 @@ RUN cd /workspace/liboqs && \
     ninja && \
     ninja install
 
+# Fix linker paths
+RUN echo "/usr/local/lib" >> /etc/ld.so.conf.d/liboqs.conf && \
+    echo "/usr/local/lib64" >> /etc/ld.so.conf.d/liboqs.conf && \
+    ldconfig
+
+# 🔥 THIS FIXES YOUR ISSUE
+RUN ln -sf /usr/local/lib/liboqs.so.0 /usr/local/lib/liboqs.so || true
+
+
 # 🔥 Force linker to know about liboqs
 RUN echo "/usr/local/lib" >> /etc/ld.so.conf.d/liboqs.conf && \
     echo "/usr/local/lib64" >> /etc/ld.so.conf.d/liboqs.conf && \
