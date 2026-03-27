@@ -36,10 +36,10 @@ THRESHOLD_PATH = "models/seq_threshold.json"
 WINDOW_SIZE = 16
 
 # Training batch size
-BATCH_SIZE = 32
+BATCH_SIZE = 8
 
 # Number of training passes
-EPOCHS = 25
+EPOCHS = 20
 
 
 # ================================
@@ -114,7 +114,11 @@ def main():
     # Autoencoder learns input → output (same)
     dataset = TensorDataset(X, X)
 
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    loader = DataLoader(dataset, 
+                        batch_size=BATCH_SIZE, 
+                        shuffle=True,
+                        num_workers=0,
+                        pin_memory=False)
 
     # ============================
     # 🧠 Build model
@@ -135,26 +139,33 @@ def main():
     # ============================
     # 🔁 Training loop
     # ============================
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+
     print("\nStarting training...\n")
 
     for epoch in range(EPOCHS):
+        model.train()
         total_loss = 0.0
 
         for batch_x, _ in loader:
-            batch_x = batch_x.to(device)
+            batch_x = batch_x.to(device, non_blocking=False)
 
-            # Forward pass
+            optimizer.zero_grad(set_to_none=True)
+
             pred = model(batch_x)
-
-            # Compare prediction vs original
             loss = loss_fn(pred, batch_x)
 
-            # Backpropagation
-            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
+
+            # Free batch refs quickly on Jetson
+            del batch_x, pred, loss
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         print(f"Epoch {epoch + 1}/{EPOCHS} → loss={total_loss:.6f}")
 
