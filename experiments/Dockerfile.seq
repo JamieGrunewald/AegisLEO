@@ -1,0 +1,13 @@
+FROM nvcr.io/nvidia/l4t-pytorch:r36.2.0-pth2.2-py3
+
+WORKDIR /workspace
+
+COPY . /workspace
+
+RUN pip install --no-cache-dir \
+    pandas \
+    scikit-learn \
+    joblib \
+    tqdm
+
+CMD ["bash"]
