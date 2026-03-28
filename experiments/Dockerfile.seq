@@ -17,14 +17,20 @@ RUN pip install --no-cache-dir -r requirements.runtime.txt
 RUN cd /workspace/liboqs && \
     mkdir -p build && \
     cd build && \
-    cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local .. && \
+    cmake -GNinja \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON \
+        -DOQS_BUILD_ONLY_LIB=ON \
+        .. && \
     ninja && \
     ninja install && \
-    ldconfig
+    ldconfig && \
+    find /usr/local -name "liboqs.so*" && \
+    ldconfig -p | grep oqs
 
 ENV OQS_INSTALL_PATH=/usr/local
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH}
 
-RUN pip install --no-cache-dir liboqs-python
+RUN pip install --no-cache-dir liboqs-python --no-binary liboqs-python
 
 CMD ["bash"]
