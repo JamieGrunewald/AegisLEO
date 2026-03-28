@@ -12,7 +12,9 @@ What changed in v0.13.0
 2. Increased patience for lossy-link telemetry delivery
 3. Reduced premature give-up behavior on late NACK/ACK cycles
 4. Kept one telemetry message in flight at a time
-5. Preserved existing crypto + transport framing behavior
+5. Byte-stuffed length field in write_transport_packet so 0x7E/0x7F
+   never appear raw in the length field and cause framing misalignment
+6. Matching byte-unstuffing in extract_framed_packets for ACK/NACK parsing
 """
 
 from __future__ import annotations
@@ -68,8 +70,41 @@ TELEMETRY_MAX_QUIET_CYCLES = 3
 # ---------------------------------------------------------------------
 # Framing markers used over the serial link
 # ---------------------------------------------------------------------
+# Every frame we send over the serial link is wrapped like this:
+#
+#   [FRAME_START][STUFFED_LENGTH(4+)][PAYLOAD][FRAME_END]
+#
+# FRAME_START (0x7E) marks where a frame begins.
+# FRAME_END   (0x7F) marks where a frame ends.
+#
+# The receiver scans the raw byte stream for FRAME_START, then reads
+# the length field to know exactly how many payload bytes to expect,
+# then confirms FRAME_END is in the right place.
 FRAME_START = b"\x7E"
 FRAME_END = b"\x7F"
+
+# Byte-stuffing constants
+# -----------------------
+# Problem: our chunk payloads are 140-220 bytes long. The low byte of
+# the 4-byte big-endian length field will regularly be 0x7E (126) or
+# 0x7F (127) — right in that range. When that happens, the receiver
+# finds a false FRAME_START or FRAME_END inside the length field, loses
+# byte alignment, and every subsequent frame is corrupted. This was the
+# root cause of the bad_end cascade seen in the transmitter logs.
+#
+# Solution: byte-stuffing (the same technique used in HDLC and PPP).
+# Before writing the length field to the wire, we escape any byte that
+# could be mistaken for a frame boundary:
+#
+#   0x7E  ->  0x7D 0x5E    (0x7E XOR 0x20 = 0x5E)
+#   0x7F  ->  0x7D 0x5F    (0x7F XOR 0x20 = 0x5F)
+#   0x7D  ->  0x7D 0x5D    (0x7D XOR 0x20 = 0x5D, escape byte itself)
+#
+# The receiver reverses this when reading the length field.
+# The payload itself does NOT need stuffing — it is base64 encoded and
+# base64 only uses A-Z a-z 0-9 + / = which never contain 0x7E or 0x7F.
+FRAME_ESC     = 0x7D   # escape byte — signals that the next byte is stuffed
+FRAME_ESC_XOR = 0x20   # XOR mask applied to the original byte after escaping
 
 # ---------------------------------------------------------------------
 # Debug flags
@@ -153,20 +188,166 @@ def make_chunk_packets(
     return packets
 
 
+def _stuff_length(length_bytes: bytes) -> bytes:
+    """
+    Byte-stuff a 4-byte length field before writing it to the wire.
+
+    Why the leading underscore?
+    ---------------------------
+    In Python, a single leading underscore means "private helper".
+    It signals to other developers: this function is an internal detail,
+    not part of the public interface. You should call write_transport_packet(),
+    not _stuff_length() directly.
+
+    What it does
+    ------------
+    Walks through the 4 raw length bytes one at a time. Any byte that
+    equals 0x7E, 0x7F, or 0x7D gets replaced with a two-byte escape
+    sequence. All other bytes pass through unchanged.
+
+    Example
+    -------
+    Payload length = 126 (0x0000007E in big-endian)
+    Raw bytes      = [0x00, 0x00, 0x00, 0x7E]
+    After stuffing = [0x00, 0x00, 0x00, 0x7D, 0x5E]  <- 5 bytes, not 4
+
+    The receiver's _unstuff_length() reverses this exactly.
+
+    Parameters
+    ----------
+    length_bytes : bytes
+        The raw 4-byte big-endian representation of the payload length.
+
+    Returns
+    -------
+    bytes
+        The stuffed version — 4 to 8 bytes depending on how many
+        bytes needed escaping.
+    """
+    out = bytearray()
+    for b in length_bytes:
+        if b in (0x7E, 0x7F, 0x7D):
+            # Escape sequence: emit 0x7D followed by (original XOR 0x20)
+            out.append(FRAME_ESC)
+            out.append(b ^ FRAME_ESC_XOR)
+        else:
+            # Safe byte — pass through unchanged
+            out.append(b)
+    return bytes(out)
+
+
+def _unstuff_length(buf: bytearray, start: int) -> tuple[int | None, int]:
+    """
+    Read and unstuff a 4-byte length field from the receive buffer.
+
+    This is the exact reverse of _stuff_length().
+
+    When is this called?
+    --------------------
+    The transmitter calls this when reading ACK/NACK control packets
+    coming BACK from the ground station. The ground station also stuffs
+    its length fields (in write_framed_packet), so we must unstuff them
+    before we can trust the length value.
+
+    How it works
+    ------------
+    We read raw bytes from buf starting at index `start`, one at a time.
+    We accumulate DECODED bytes in `out` until we have 4 of them.
+
+    If we see FRAME_ESC (0x7D), the NEXT byte is the stuffed value.
+    We XOR it with FRAME_ESC_XOR (0x20) to recover the original byte,
+    and advance by 2 positions in the raw buffer (consumed 2 raw bytes
+    but only produced 1 decoded byte).
+
+    If the byte is anything else, it passes through as-is (1 raw byte
+    produces 1 decoded byte).
+
+    Parameters
+    ----------
+    buf   : bytearray
+        The raw serial receive buffer.
+    start : int
+        Index in buf where the stuffed length field begins.
+        This is always 1 (immediately after the FRAME_START byte).
+
+    Returns
+    -------
+    tuple[int | None, int]
+        (length_value, bytes_consumed)
+
+        length_value  : the decoded integer payload length, or None if
+                        buf doesn't have enough bytes yet to finish
+                        reading the length field — caller should wait
+                        for more serial data before trying again.
+
+        bytes_consumed: how many raw bytes from buf the length field
+                        used up. Because of stuffing this is between
+                        4 (no bytes needed escaping) and 8 (all four
+                        bytes needed escaping). The caller uses this
+                        to know where the payload actually starts.
+    """
+    out = bytearray()   # decoded length bytes — we need exactly 4
+    i = start           # current read position in the raw buffer
+
+    while len(out) < 4:
+        if i >= len(buf):
+            # Ran off the end of the buffer before collecting 4 bytes.
+            # Tell the caller to wait for more incoming serial data.
+            return None, 0
+
+        b = buf[i]
+
+        if b == FRAME_ESC:
+            # Escape sequence — the NEXT byte holds the real value XOR 0x20
+            if i + 1 >= len(buf):
+                # The escape byte arrived but its follower hasn't yet.
+                return None, 0
+            out.append(buf[i + 1] ^ FRAME_ESC_XOR)
+            i += 2      # consumed 2 raw bytes, produced 1 decoded byte
+        else:
+            out.append(b)
+            i += 1      # consumed 1 raw byte, produced 1 decoded byte
+
+    # i - start = total raw bytes consumed by this length field
+    return int.from_bytes(out, "big"), i - start
+
+
 def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     """
-    Send one transport packet using the framing the receiver expects.
+    Serialize and send one transport chunk packet over the serial link.
 
-    Wire format:
-        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
+    Wire format
+    -----------
+    [FRAME_START][STUFFED_LEN(4+)][PAYLOAD][FRAME_END]
+
+    FRAME_START   : 1 byte  (0x7E) — marks the start of a frame
+    STUFFED_LEN   : 4-8 bytes — big-endian payload length, byte-stuffed
+                    so 0x7E/0x7F/0x7D never appear raw and can't be
+                    mistaken for frame boundaries
+    PAYLOAD       : variable — compact JSON, safe because base64 encoded
+    FRAME_END     : 1 byte  (0x7F) — marks the end of a frame
+
+    Parameters
+    ----------
+    ser : serial.Serial
+        The open serial port connected to the LoRa module.
+    pkt : dict
+        The transport chunk packet to send. Contains fields like
+        t, sid, i, n, d, c, and optionally mid.
     """
+    # Compact JSON — no extra spaces, smallest possible wire footprint.
     payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
-    length = len(payload).to_bytes(4, "big")
+
+    # Byte-stuff the length field so frame boundaries can never appear
+    # inside it, regardless of what the payload length value happens to be.
+    length = _stuff_length(len(payload).to_bytes(4, "big"))
+
     wire = FRAME_START + length + payload + FRAME_END
     ser.write(wire)
     ser.flush()
 
-    # Tiny pause to reduce back-to-back serial flooding.
+    # Tiny pause to prevent back-to-back writes from overflowing the
+    # SX1262 module's serial input buffer on the LoRa side.
     time.sleep(0.02)
 
 
@@ -211,55 +392,101 @@ def send_chunk_packets(
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     """
-    Extract complete framed packets from the receive buffer.
+    Extract complete framed packets from the raw serial receive buffer.
 
-    Expected frame format:
-        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
+    This is used on the TRANSMITTER side to parse ACK/NACK control
+    packets coming BACK from the ground station after each transmission.
 
-    This is used on the transmitter side to parse ACK/NACK control traffic
-    coming back from the ground station.
+    Wire format expected
+    --------------------
+    [FRAME_START][STUFFED_LEN(4+)][PAYLOAD][FRAME_END]
+
+    Why a buffer instead of just reading bytes directly?
+    ----------------------------------------------------
+    Serial reads are not guaranteed to give you exactly one frame at a
+    time. A single ser.read() call might return:
+      - half a frame (the rest hasn't arrived yet)
+      - one full frame
+      - one and a half frames (next frame started arriving)
+      - multiple frames merged together
+
+    So we accumulate ALL incoming bytes into a bytearray buffer and
+    then call this function to carve out complete frames. Anything
+    incomplete stays in the buffer and gets processed on the next read.
+
+    Recovery behavior
+    -----------------
+    If the parser finds something that doesn't look right (invalid
+    length, wrong end marker), it drops ONE byte and tries again from
+    the next position. This means a single corrupted byte causes at most
+    one frame to be lost — not a full buffer wipe.
     """
     frames: list[bytes] = []
 
     while True:
+        # Scan forward to the next FRAME_START byte.
+        # Anything before it is garbage (partial frame, line noise) — discard.
         start = buffer.find(FRAME_START)
 
         if start == -1:
+            # No frame start anywhere in the buffer — clear everything.
             buffer.clear()
             break
 
         if start > 0:
+            # Junk bytes before the frame start — skip past them.
             del buffer[:start]
 
-        if len(buffer) < 5:
+        # Need at least FRAME_START + 1 byte of length field to proceed.
+        if len(buffer) < 2:
             break
 
         if buffer[0:1] != FRAME_START:
             del buffer[0]
             continue
 
-        payload_len = int.from_bytes(buffer[1:5], "big")
+        # Decode the stuffed length field starting at index 1.
+        # Returns (None, 0) if the buffer is too short to read it fully.
+        payload_len, len_consumed = _unstuff_length(buffer, 1)
+
+        if payload_len is None:
+            # Haven't received all the length bytes yet — wait for more.
+            break
 
         if payload_len <= 0 or payload_len > 4096:
+            # Length value is out of range — this is not a valid frame.
+            # Drop one byte and search for the next FRAME_START.
             if DEBUG_BAD_FRAMES:
                 dlog("SAT", "WARN", "Invalid frame length while resyncing", payload_len=payload_len)
             del buffer[0]
             continue
 
-        total_len = 1 + 4 + payload_len + 1
+        # Total frame size:
+        #   1 byte  FRAME_START
+        #   len_consumed bytes  stuffed length field (4 to 8 bytes)
+        #   payload_len bytes   payload
+        #   1 byte  FRAME_END
+        total_len = 1 + len_consumed + payload_len + 1
 
         if len(buffer) < total_len:
+            # Full frame hasn't arrived yet — wait for more serial data.
             break
 
-        payload = bytes(buffer[5:5 + payload_len])
-        end_marker = buffer[5 + payload_len:5 + payload_len + 1]
+        # Extract the payload bytes from the correct position.
+        payload_start = 1 + len_consumed
+        payload = bytes(buffer[payload_start:payload_start + payload_len])
+
+        # Verify FRAME_END is exactly where we expect it.
+        end_marker = buffer[total_len - 1:total_len]
 
         if end_marker != FRAME_END:
+            # End marker is wrong — alignment is off. Drop one byte and retry.
             if DEBUG_BAD_FRAMES:
                 dlog("SAT", "WARN", "Bad frame end marker while resyncing", end_marker=repr(end_marker))
             del buffer[0]
             continue
 
+        # Valid frame — consume it from the buffer and add to results.
         del buffer[:total_len]
         frames.append(payload)
 

@@ -1,10 +1,10 @@
 """
 AegisLEO Ground Station Secure Receiver
-Transport-Hardened RF Version with Selective Recovery for session_init
+Transport-Hardened RF Version with ReassemblyFactory + Byte-Stuffed Framing
 
 Created by: Jamie Grunewald
 Date: 2026-03-25
-Version: v0.12.0
+Version: v0.13.0
 
 What this script does
 ---------------------
@@ -22,37 +22,33 @@ High-level flow
 7. Run ML anomaly detection
 8. Send ACK/NACK back to the satellite side
 
-Framing upgrade in this version
--------------------------------
-Old framing:
-    FRAME_START + JSON + FRAME_END
+Framing in this version
+-----------------------
+Wire format (both directions):
+    FRAME_START + STUFFED_LEN(4+) + PAYLOAD + FRAME_END
 
-New framing:
-    FRAME_START + 4-byte big-endian payload length + JSON + FRAME_END
+The 4-byte big-endian length field is byte-stuffed so that 0x7E, 0x7F,
+and 0x7D never appear raw inside it. This prevents the parser from
+misreading a length byte as a frame boundary on a noisy RF link.
 
-Why this helps
---------------
-Single-byte delimiter framing is fragile on noisy links because partial reads
-or merged reads can cause false frame boundaries. Length-prefix framing gives
-the receiver an exact payload size to expect.
+Reassembly in this version
+---------------------------
+ChunkAssembly and buffer management have been extracted into
+ReassemblyFactory (groundstation/reassembly.py). receiver.py now calls
+factory.add_chunk() per incoming chunk and factory.flush_stale() on
+idle cycles to send NACKs for expired incomplete messages.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import time
-import zlib
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from common.demo_log import (
     dlog,
     banner,
-    section,
     kv,
-    crypto_verdict,
-    ml_verdict,
 )
 from common.telemetry import Telemetry
 
@@ -65,6 +61,9 @@ from crypto.mldsa_signatures import verify, b64d
 from groundstation.replay_window import ReplayWindow
 from models.runtime_detector import RuntimeDetector
 from groundstation.feature_logger import FeatureLogger
+
+from groundstation.reassembly import ReassemblyFactory, decode_assembled_payload
+factory = ReassemblyFactory()
 
 detector = RuntimeDetector()
 feature_logger = FeatureLogger("groundstation/logs/telemetry_normal.csv")
@@ -89,6 +88,12 @@ RECEIVER_KEM_PRIVATE_KEY_PATH = "dev_secrets/groundstation/receiver_kem_private.
 FRAME_START = b"\x7E"
 FRAME_END = b"\x7F"
 FRAME_LEN_BYTES = 4
+
+# Byte-stuffing constants.
+# The 4-byte length field is escaped so 0x7E/0x7F/0x7D never appear
+# raw inside it, preventing false frame-boundary detection on RF links.
+FRAME_ESC     = 0x7D   # escape byte
+FRAME_ESC_XOR = 0x20   # XOR mask: 0x7E->0x5E, 0x7F->0x5F, 0x7D->0x5D
 
 # Maximum JSON payload size inside one transport frame.
 MAX_FRAME_JSON_BYTES = 4096
@@ -136,66 +141,6 @@ with open(SATELLITE_MLDSA_PUBLIC_KEY_PATH, "rb") as f:
 with open(RECEIVER_KEM_PRIVATE_KEY_PATH, "rb") as f:
     RECEIVER_KEM_PRIVATE_KEY = f.read()
 
-# ---------------------------------------------------------------------
-# Reassembly helper class
-# ---------------------------------------------------------------------
-
-
-@dataclass
-class ChunkAssembly:
-    """
-    Hold the pieces of one logical packet while chunks arrive.
-    """
-
-    total_chunks: int
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-    parts: dict[int, str] = field(default_factory=dict)
-
-    def add_part(self, idx: int, data: str) -> tuple[bool, bool]:
-        """
-        Returns
-        -------
-        (accepted_duplicate, conflicting_duplicate)
-        """
-        existing = self.parts.get(idx)
-
-        if existing is not None:
-            if existing == data:
-                self.updated_at = time.time()
-                return True, False
-            return False, True
-
-        self.parts[idx] = data
-        self.updated_at = time.time()
-        return False, False
-
-    def is_complete(self) -> bool:
-        return len(self.parts) == self.total_chunks
-
-    def missing_indexes(self) -> list[int]:
-        return [i for i in range(self.total_chunks) if i not in self.parts]
-
-    def assemble(self) -> str:
-        return "".join(self.parts[i] for i in range(self.total_chunks))
-
-
-# ---------------------------------------------------------------------
-# Decode the finished logical packet
-# ---------------------------------------------------------------------
-
-
-def b64text_to_packet(text: str) -> dict[str, Any]:
-    """
-    Reverse the sender-side logical packet pipeline:
-    1. base64 decode
-    2. zlib decompress
-    3. JSON decode
-    """
-    compressed = base64.b64decode(text.encode("utf-8"), validate=True)
-    raw = zlib.decompress(compressed)
-    return json.loads(raw.decode("utf-8"))
-
 
 # ---------------------------------------------------------------------
 # Runtime objects
@@ -207,7 +152,7 @@ detector = RuntimeDetector()
 
 sessions: dict[str, object] = {}
 replay_windows: dict[str, ReplayWindow] = {}
-reassembly_buffers: dict[tuple[str, str, int | None], ChunkAssembly] = {}
+
 
 # Raw serial byte buffer. We keep incomplete data here until a full frame exists.
 serial_buffer = bytearray()
@@ -252,6 +197,81 @@ def print_stats() -> None:
     )
 
 
+def _stuff_length(length_bytes: bytes) -> bytes:
+    """
+    Byte-stuff a 4-byte length field before writing to the wire.
+
+    Why we need this
+    ----------------
+    Our frame delimiters are 0x7E (FRAME_START) and 0x7F (FRAME_END).
+    If either of those values appears raw inside the 4-byte length field,
+    the parser on the other side will misread it as a frame boundary and
+    lose alignment. We escape them so the length field is always safe.
+
+    Encoding table:
+        0x7E  ->  0x7D 0x5E   (start marker escaped)
+        0x7F  ->  0x7D 0x5F   (end marker escaped)
+        0x7D  ->  0x7D 0x5D   (escape byte itself escaped)
+    """
+    out = bytearray()
+    for b in length_bytes:
+        if b in (0x7E, 0x7F, 0x7D):
+            out.append(FRAME_ESC)
+            out.append(b ^ FRAME_ESC_XOR)
+        else:
+            out.append(b)
+    return bytes(out)
+
+
+def _unstuff_length(buf: bytearray, start: int) -> tuple[int | None, int]:
+    """
+    Read and unstuff a 4-byte length field from the receive buffer.
+
+    Parameters
+    ----------
+    buf   : the raw serial receive buffer (bytearray)
+    start : index in buf where the (possibly stuffed) length field begins
+            (immediately after the FRAME_START byte)
+
+    Returns
+    -------
+    (length_value, bytes_consumed)
+        length_value  = the decoded integer length, or None if buf is
+                        too short to read the full length field yet
+        bytes_consumed = how many raw bytes from buf the length field used
+                         (4 minimum, up to 8 in the worst case where all
+                          four bytes needed escaping)
+
+    How it works
+    ------------
+    We read bytes one at a time. If we see the escape byte (0x7D) we
+    consume the NEXT byte too and XOR it with 0x20 to recover the
+    original value. We keep going until we have decoded 4 bytes of
+    actual length data.
+    """
+    out = bytearray()   # decoded length bytes accumulated here
+    i = start           # current position in buf
+
+    while len(out) < 4:
+        if i >= len(buf):
+            return None, 0      # not enough bytes yet — wait for more
+
+        b = buf[i]
+
+        if b == FRAME_ESC:
+            # Escape sequence: the NEXT byte is the real value XOR 0x20
+            if i + 1 >= len(buf):
+                return None, 0  # escape byte arrived but follower hasn't yet
+            out.append(buf[i + 1] ^ FRAME_ESC_XOR)
+            i += 2              # consumed 2 raw bytes for 1 decoded byte
+        else:
+            out.append(b)
+            i += 1              # consumed 1 raw byte for 1 decoded byte
+
+    # i - start = total raw bytes consumed by the length field
+    return int.from_bytes(out, "big"), i - start
+
+
 def write_framed_packet(pkt: dict[str, Any]) -> None:
     """
     Send one ACK/NACK control packet back to the satellite using
@@ -261,7 +281,8 @@ def write_framed_packet(pkt: dict[str, Any]) -> None:
         [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
     """
     payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
-    length = len(payload).to_bytes(4, "big")
+    # Byte-stuff the length so 0x7E/0x7F/0x7D never appear raw in it.
+    length = _stuff_length(len(payload).to_bytes(4, "big"))
     wire = FRAME_START + length + payload + FRAME_END
     ser.write(wire)
     ser.flush()
@@ -300,48 +321,72 @@ def send_nack(session_id: str, missing: list[int], message_id: int | None = None
 def get_reassembly_ttl(message_id: int | None) -> float:
     return SESSION_INIT_TTL_SECONDS if message_id is None else TELEMETRY_TTL_SECONDS
 
+def add_transport_chunk(packet: dict[str, Any]) -> tuple[str, int | None, str] | None:
+    """
+    Hand one incoming transport chunk to ReassemblyFactory.
 
-def cleanup_reassembly_buffers() -> None:
-    now = time.time()
-    stale_keys: list[tuple[str, str, int | None]] = []
+    Returns (session_id, message_id, assembled_b64) when ALL chunks for
+    this message have arrived and the full payload is ready to decode.
+    Returns None while we are still waiting for more chunks.
 
-    for key, buf in reassembly_buffers.items():
-        _, _, message_id = key
-        ttl = get_reassembly_ttl(message_id)
-        age = now - buf.updated_at
+    Why this wrapper exists
+    -----------------------
+    The main loop calls this by name for every incoming chunk packet.
+    All factory interaction and stats sync lives here in one place,
+    keeping the main loop readable.
+    """
+    chunk_type    = packet["t"]
+    session_id    = packet["sid"]
+    message_id    = packet.get("mid")
+    chunk_index   = int(packet["i"])
+    chunk_total   = int(packet["n"])
+    data_fragment = packet["d"]
+    crc_expected  = int(packet["c"])
 
-        if age > ttl and not buf.is_complete():
-            stale_keys.append(key)
+    # Hand the chunk to the factory.
+    # It handles: CRC check, duplicate detection, conflict detection,
+    # TTL cleanup, buffer management, and reassembly completion.
+    is_complete, missing = factory.add_chunk(
+        chunk_type=chunk_type,
+        session_id=session_id,
+        message_id=message_id,
+        chunk_index=chunk_index,
+        chunk_total=chunk_total,
+        data_fragment=data_fragment,
+        crc_expected=crc_expected,
+    )
 
-    for key in stale_keys:
-        _, session_id, message_id = key
-        buf = reassembly_buffers[key]
-        missing = buf.missing_indexes()
+    # Sync factory stats into the local STATS dict so print_stats() works.
+    state = factory.debug_state()
+    STATS["chunks_total"]      = state["chunks_total"]
+    STATS["chunks_accepted"]   = state["chunks_accepted"]
+    STATS["chunks_duplicate"]  = state["chunks_duplicate"]
+    STATS["chunks_conflict"]   = state["chunks_conflict"]
+    STATS["chunks_crc_fail"]   = state["chunks_crc_fail"]
+    STATS["reassembly_complete"] = state["reassembled"]
 
-        if DEBUG_ACKS:
-            label = "session_init" if message_id is None else "telemetry"
-            print(
-                f"[GROUND][INFO] stale {label} sid={session_id} mid={message_id} "
-                f"have={len(buf.parts)}/{buf.total_chunks} missing_count={len(missing)}"
-            )
+    if DEBUG_CHUNKS:
+        suffix = "" if not missing else f" missing={len(missing)}"
+        print(
+            f"[GROUND][CHUNK] t={chunk_type} sid={session_id} "
+            f"mid={message_id} idx={chunk_index}/{chunk_total - 1}{suffix}"
+        )
 
-            if len(missing) <= 10:
-                print(
-                    f"[GROUND][RECOVERY] sid={session_id} mid={message_id} "
-                    f"remaining_missing={missing}"
-                )
-            else:
-                print(
-                    f"[GROUND][RECOVERY] sid={session_id} mid={message_id} "
-                    f"remaining_missing_count={len(missing)}"
-                )
+    if not is_complete:
+        return None
 
-        send_nack(session_id=session_id, message_id=message_id, missing=missing)
+    # Message is complete. Retrieve the assembled payload and clean up.
+    assembled_b64 = factory.get_assembled(chunk_type, session_id, message_id)
+    if assembled_b64 is None:
+        return None  # Defensive guard, should not happen in normal flow.
 
-        new_buf = ChunkAssembly(total_chunks=buf.total_chunks)
-        new_buf.parts = dict(buf.parts)
-        new_buf.updated_at = time.time()
-        reassembly_buffers[key] = new_buf
+    if DEBUG_REASSEMBLY:
+        print(
+            f"[GROUND][REASSEMBLED] t={chunk_type} sid={session_id} "
+            f"mid={message_id} len={len(assembled_b64)}"
+        )
+
+    return session_id, message_id, assembled_b64
 
 
 def validate_transport_packet(packet: dict[str, Any]) -> bool:
@@ -388,93 +433,6 @@ def validate_transport_packet(packet: dict[str, Any]) -> bool:
 
     return True
 
-
-def add_transport_chunk(packet: dict[str, Any]) -> tuple[str, int | None, str] | None:
-    cleanup_reassembly_buffers()
-
-    chunk_type = packet["t"]
-    session_id = packet["sid"]
-    message_id = packet.get("mid")
-    chunk_index = int(packet["i"])
-    chunk_total = int(packet["n"])
-    data_fragment = packet["d"]
-
-    STATS["chunks_total"] += 1
-
-    expected_crc = int(packet["c"])
-    actual_crc = zlib.crc32(data_fragment.encode("utf-8")) & 0xFFFFFFFF
-
-    if actual_crc != expected_crc:
-        STATS["chunks_crc_fail"] += 1
-        print(
-            f"[GROUND][CRC] bad chunk sid={session_id} mid={message_id} "
-            f"idx={chunk_index} expected={expected_crc:#010x} actual={actual_crc:#010x}"
-        )
-        return None
-
-    key = (chunk_type, session_id, message_id)
-
-    if key not in reassembly_buffers:
-        reassembly_buffers[key] = ChunkAssembly(total_chunks=chunk_total)
-
-    buf = reassembly_buffers[key]
-
-    if buf.total_chunks != chunk_total:
-        if DEBUG_SCHEMA:
-            print(
-                f"[GROUND][SCHEMA] chunk total mismatch sid={session_id} "
-                f"mid={message_id} old_total={buf.total_chunks} new_total={chunk_total}"
-            )
-        del reassembly_buffers[key]
-        return None
-
-    accepted_duplicate, conflicting_duplicate = buf.add_part(chunk_index, data_fragment)
-
-    if accepted_duplicate:
-        STATS["chunks_duplicate"] += 1
-
-    if conflicting_duplicate:
-        STATS["chunks_conflict"] += 1
-        print(
-            f"[GROUND][WARN] conflicting duplicate chunk sid={session_id} "
-            f"mid={message_id} idx={chunk_index} -> resetting assembly"
-        )
-        del reassembly_buffers[key]
-        return None
-
-    if not accepted_duplicate:
-        STATS["chunks_accepted"] += 1
-
-    if DEBUG_CHUNKS:
-        suffix = " DUP" if accepted_duplicate else ""
-        print(
-            f"[GROUND][CHUNK] t={chunk_type} sid={session_id} "
-            f"mid={message_id} idx={chunk_index}/{chunk_total - 1}{suffix}"
-        )
-
-    if DEBUG_REASSEMBLY:
-        print(
-            f"[GROUND][REASSEMBLY] sid={session_id} mid={message_id} "
-            f"have={len(buf.parts)}/{buf.total_chunks}"
-        )
-
-    if not buf.is_complete():
-        return None
-
-    assembled_b64 = buf.assemble()
-    del reassembly_buffers[key]
-
-    STATS["reassembly_complete"] += 1
-
-    if DEBUG_REASSEMBLY:
-        print(
-            f"[GROUND][REASSEMBLED] t={chunk_type} sid={session_id} "
-            f"mid={message_id} len={len(assembled_b64)}"
-        )
-
-    return session_id, message_id, assembled_b64
-
-
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     
     """
@@ -519,22 +477,32 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
             del buffer[0]
             continue
 
-        payload_len = int.from_bytes(buffer[1:5], "big")
+        # Unstuff the length field. It starts at index 1 (after FRAME_START).
+        # _unstuff_length returns (None, 0) if the buffer doesn't yet have
+        # enough bytes to decode a full length field — we wait for more.
+        payload_len, len_consumed = _unstuff_length(buffer, 1)
+
+        if payload_len is None:
+            break   # incomplete length field, wait for more serial data
 
         if payload_len <= 0 or payload_len > MAX_FRAME_JSON_BYTES:
             if DEBUG_BAD_FRAMES:
                 print(f"[GROUND] WARN: invalid frame length {payload_len}, dropping 1 byte to resync")
+            STATS["frames_bad_length"] += 1
             del buffer[0]
             continue
 
-        total_len = 1 + 4 + payload_len + 1  # start + len + payload + end
+        # Total frame size accounts for variable-width stuffed length field:
+        #   1 (FRAME_START) + len_consumed (stuffed length) + payload_len + 1 (FRAME_END)
+        total_len = 1 + len_consumed + payload_len + 1
 
         if len(buffer) < total_len:
-            # Incomplete frame, wait for more bytes.
+            # Incomplete frame — wait for more bytes.
             break
 
-        payload = bytes(buffer[5:5 + payload_len])
-        end_marker = buffer[5 + payload_len:5 + payload_len + 1]
+        payload_start = 1 + len_consumed
+        payload = bytes(buffer[payload_start:payload_start + payload_len])
+        end_marker = buffer[total_len - 1:total_len]
 
         if end_marker != FRAME_END:
             # Count framing failures so the stats line reflects reality.
@@ -569,7 +537,14 @@ while True:
         if incoming:
             serial_buffer.extend(incoming)
         else:
-            cleanup_reassembly_buffers()
+            # No data arrived this read cycle.
+            # Ask the factory to evict any stale incomplete messages
+            # and send a NACK for each one so the satellite knows to retry.
+            for sid, mid, missing in factory.flush_stale():
+                label = "session_init" if mid is None else "telemetry"
+                if DEBUG_ACKS:
+                    print(f"[GROUND][INFO] stale {label} sid={sid} mid={mid} missing_count={len(missing)}")
+                send_nack(session_id=sid, message_id=mid, missing=missing)
             print_stats()
             continue
 
@@ -613,6 +588,9 @@ while True:
             if transport_packet.get("t") in {"ack", "nack"}:
                 continue
 
+            # add_transport_chunk hands this chunk to ReassemblyFactory.
+            # Returns None while chunks are still missing.
+            # Returns (session_id, message_id, assembled_b64) when complete.
             reassembled = add_transport_chunk(transport_packet)
             if reassembled is None:
                 continue
@@ -620,7 +598,9 @@ while True:
             session_id, message_id, assembled_b64 = reassembled
 
             try:
-                packet = b64text_to_packet(assembled_b64)
+                # decode_assembled_payload reverses the transmitter pipeline:
+                #   base64 -> zlib decompress -> JSON parse -> Python dict
+                packet = decode_assembled_payload(assembled_b64)
             except Exception as exc:
                 print(
                     f"[GROUND] WARN: logical packet decode failed "
@@ -725,28 +705,7 @@ while True:
                     print(f"[GROUND] REJECTED: session expired ({session_id})")
                     send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
-                
-                """
-                Extract complete length-prefixed frames from the raw serial buffer.
 
-                Frame format
-                ------------
-                [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
-
-                Why this parser exists
-                ----------------------
-                LoRa/serial links can split, merge, or corrupt bytes. We therefore:
-                - discard garbage before FRAME_START
-                - require the 4-byte payload length field
-                - wait until the full frame is present
-                - verify FRAME_END before accepting the payload
-                - drop 1 byte and resync if framing looks wrong
-
-                Important design rule
-                ---------------------
-                We trust the payload length more than blind delimiter searching.
-                That gives us more stable recovery on noisy links.
-                """
                 if DEBUG_SHOW_CIPHERTEXT:
                     ciphertext_b64 = packet["ciphertext"]
                     nonce_b64 = packet["nonce"]

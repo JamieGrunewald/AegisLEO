@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 import oqs
 
+__all__ = ["generate_keypair", "sign", "verify", "b64e", "b64d", "SignatureKeypair"]
 
 # ---------------------------------------------------------------------
 # COMPATIBILITY LAYER (VERY IMPORTANT)
