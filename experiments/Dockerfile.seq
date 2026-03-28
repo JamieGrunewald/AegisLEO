@@ -9,23 +9,27 @@ RUN apt-get update && apt-get install -y \
     ninja-build \
     build-essential \
     git \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir -r requirements.runtime.txt
 
+# Build and install liboqs from your repo copy
 RUN cd /workspace/liboqs && \
     mkdir -p build && \
     cd build && \
-    cmake -GNinja .. && \
+    cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local .. && \
     ninja && \
     ninja install && \
-    cp -av /workspace/liboqs/build/lib/liboqs.so* /usr/local/lib/ && \
-    echo "/usr/local/lib" > /etc/ld.so.conf.d/liboqs.conf && \
-    echo "/usr/local/lib64" >> /etc/ld.so.conf.d/liboqs.conf && \
     ldconfig
 
-ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH}
 
-RUN pip install --no-cache-dir liboqs-python
+# Install Python bindings from the local source tree if present
+RUN if [ -d /workspace/liboqs-python ]; then \
+        pip install --no-cache-dir /workspace/liboqs-python; \
+    else \
+        pip install --no-cache-dir liboqs-python; \
+    fi
 
 CMD ["bash"]
