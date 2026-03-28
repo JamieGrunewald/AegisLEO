@@ -19,6 +19,9 @@ RUN cd /workspace/liboqs && \
     cmake -GNinja .. && \
     ninja && \
     ninja install && \
+    cp -av /workspace/liboqs/build/lib/liboqs.so* /usr/local/lib/ && \
+    echo "/usr/local/lib" > /etc/ld.so.conf.d/liboqs.conf && \
+    echo "/usr/local/lib64" >> /etc/ld.so.conf.d/liboqs.conf && \
     ldconfig
 
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:$LD_LIBRARY_PATH
