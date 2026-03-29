@@ -343,7 +343,7 @@ class ChunkAssembly:
 # Telemetry gets less time because packets are smaller and we'd rather
 # move on than hold stale state forever.
 
-SESSION_INIT_TTL_SECONDS = 120.0
+SESSION_INIT_TTL_SECONDS = 600.0
 TELEMETRY_TTL_SECONDS    = 30.0
 
 # The receiver's NACK packet can only list this many missing chunk indexes.
