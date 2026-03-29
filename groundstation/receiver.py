@@ -546,7 +546,6 @@ while True:
             # Ask the factory to evict any stale incomplete messages
             # and send a NACK for each one so the satellite knows to retry.
             # Periodically send NACKs for incomplete sessions without expiring buffers
-            global NACK_LAST_SENT
             now = time.time()
             if now - NACK_LAST_SENT >= NACK_SEND_INTERVAL:
                 NACK_LAST_SENT = now
