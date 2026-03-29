@@ -508,7 +508,7 @@ class ReassemblyFactory:
 
         # Run cleanup first so stale buffers don't accumulate indefinitely.
         # We do this on every chunk arrival — it's cheap and keeps memory tidy.
-        self._cleanup_stale()
+        self.flush_stale()
 
         self.stats_chunks_total += 1
 
@@ -621,7 +621,7 @@ class ReassemblyFactory:
 
 
     # -------------------------------------------------------------------------
-    # METHOD: _cleanup_stale
+    # METHOD: flush_stale
     # -------------------------------------------------------------------------
     # Scans all in-flight buffers and removes any that have exceeded their
     # TTL without completing. This prevents memory from growing without
@@ -631,7 +631,7 @@ class ReassemblyFactory:
     # Complete buffers are removed by get_assembled(), not here.
     # -------------------------------------------------------------------------
 
-    def _cleanup_stale(self) -> list[tuple[str, int | None, list[int]]]:
+    def flush_stale(self) -> list[tuple[str, int | None, list[int]]]:
         """
         Remove stale incomplete buffers and return their missing chunk lists.
 
