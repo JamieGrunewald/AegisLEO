@@ -131,6 +131,8 @@ STATS = {
 
 STATS_LAST_PRINT = time.time()
 STATS_PRINT_INTERVAL = 5.0
+NACK_LAST_SENT = time.time()
+NACK_SEND_INTERVAL = 30.0
 
 # ---------------------------------------------------------------------
 # Load key material
@@ -543,6 +545,20 @@ while True:
             # No data arrived this read cycle.
             # Ask the factory to evict any stale incomplete messages
             # and send a NACK for each one so the satellite knows to retry.
+            # Periodically send NACKs for incomplete sessions without expiring buffers
+            now = time.time()
+            global NACK_LAST_SENT
+            if now - NACK_LAST_SENT >= NACK_SEND_INTERVAL:
+                NACK_LAST_SENT = now
+                for key, buf in list(factory._buffers.items()):
+                    if not buf.is_complete():
+                        _, session_id_k, message_id_k = key
+                        missing_k = buf.missing_indexes()
+                        if missing_k:
+                            label = "session_init" if message_id_k is None else "telemetry"
+                            if DEBUG_ACKS:
+                                print(f"[GROUND][INFO] periodic nack {label} sid={session_id_k} mid={message_id_k} missing_count={len(missing_k)}")
+                            send_nack(session_id=session_id_k, message_id=message_id_k, missing=missing_k)
             for sid, mid, missing in factory.flush_stale():
                 label = "session_init" if mid is None else "telemetry"
                 if DEBUG_ACKS:
