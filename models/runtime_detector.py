@@ -21,7 +21,7 @@ import torch.nn as nn
 
 
 # Must match training script
-WINDOW_SIZE = 16
+WINDOW_SIZE = 4
 MODEL_PATH = Path("models/seq_autoencoder.pt")
 THRESHOLD_PATH = Path("models/seq_threshold.json")
 

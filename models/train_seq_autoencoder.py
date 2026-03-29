@@ -23,7 +23,7 @@ from window_dataset import build_windows
 
 
 # TEMP path (you said this is intentional)
-DATA_PATH = "groundstation/logs/_generated_telemetry.csv"
+DATA_PATH = "groundstation/logs/telemetry_normal.csv"
 #DATA_PATH = "groundstation/logs/telemetry_normal.csv"
 
 # Where trained model will be saved
@@ -33,7 +33,7 @@ MODEL_PATH = "models/seq_autoencoder.pt"
 THRESHOLD_PATH = "models/seq_threshold.json"
 
 # Number of time steps per sequence
-WINDOW_SIZE = 16
+WINDOW_SIZE = 4
 
 # Training batch size
 BATCH_SIZE = 8
@@ -159,7 +159,7 @@ def main():
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item().item()
+            total_loss += loss.item()
 
             # Free batch refs quickly on Jetson
             del batch_x, pred, loss
