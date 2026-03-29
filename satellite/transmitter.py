@@ -51,10 +51,10 @@ APID = 100
 # ---------------------------------------------------------------------
 # Chunking / pacing
 # ---------------------------------------------------------------------
-SESSION_INIT_CHUNK_SIZE = 220
+SESSION_INIT_CHUNK_SIZE = 160
 TELEMETRY_CHUNK_SIZE = 140
 
-SESSION_INIT_CHUNK_DELAY_SECONDS = 0.80
+SESSION_INIT_CHUNK_DELAY_SECONDS = 0.50
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.35
 
 ACK_WAIT_SECONDS = 15.0
