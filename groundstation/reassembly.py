@@ -344,11 +344,11 @@ class ChunkAssembly:
 # move on than hold stale state forever.
 
 SESSION_INIT_TTL_SECONDS = 25.0
-TELEMETRY_TTL_SECONDS    =  8.0
+TELEMETRY_TTL_SECONDS    = 30.0
 
 # The receiver's NACK packet can only list this many missing chunk indexes.
 # If more are missing, we send the first N and wait for the next round.
-MAX_MISSING_PER_NACK = 24
+MAX_MISSING_PER_NACK = 36
 
 
 # Type alias for the reassembly key.
