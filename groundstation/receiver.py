@@ -286,7 +286,10 @@ def write_framed_packet(pkt: dict[str, Any]) -> None:
     wire = FRAME_START + length + payload + FRAME_END
     ser.write(wire)
     ser.flush()
-    time.sleep(0.05)
+    # Wait for LoRa half-duplex TX->RX turnaround before sending.
+    # Without this, the NACK arrives while the Pi module is still
+    # switching modes, causing frame corruption on the receive side.
+    time.sleep(0.5)
 
 
 def send_ack(session_id: str, message_id: int | None) -> None:
