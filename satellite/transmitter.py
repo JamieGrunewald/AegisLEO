@@ -57,10 +57,10 @@ TELEMETRY_CHUNK_SIZE = 140
 SESSION_INIT_CHUNK_DELAY_SECONDS = 0.50
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.35
 
-ACK_WAIT_SECONDS = 15.0
+ACK_WAIT_SECONDS = 25.0
 
 # Session-init and telemetry need different patience profiles.
-SESSION_INIT_LISTEN_CYCLES = 16
+SESSION_INIT_LISTEN_CYCLES = 32
 
 # Telemetry on this lossy link clearly needs more breathing room.
 TELEMETRY_MAX_CYCLES = 14
