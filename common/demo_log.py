@@ -15,14 +15,11 @@ Purpose:
 """
 
 from __future__ import annotations
-
 from datetime import datetime, timezone
 from typing import Any
 
-
 def _utc_ts() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
-
 
 def _format_value(value: Any) -> str:
     """
@@ -39,7 +36,6 @@ def _format_value(value: Any) -> str:
         return "TRUE" if value else "FALSE"
     return str(value)
 
-
 def _fmt_fields(**fields: Any) -> str:
     parts: list[str] = []
     for key, value in fields.items():
@@ -47,7 +43,6 @@ def _fmt_fields(**fields: Any) -> str:
             continue
         parts.append(f"{key}={_format_value(value)}")
     return " ".join(parts)
-
 
 def dlog(component: str, event: str, message: str = "", **fields: Any) -> None:
     """
@@ -64,22 +59,18 @@ def dlog(component: str, event: str, message: str = "", **fields: Any) -> None:
         line += f" {suffix}"
     print(line, flush=True)
 
-
 def banner(title: str, width: int = 76) -> None:
     print("=" * width, flush=True)
     print(title, flush=True)
     print("=" * width, flush=True)
-
 
 def section(title: str, width: int = 76) -> None:
     print("-" * width, flush=True)
     print(title, flush=True)
     print("-" * width, flush=True)
 
-
 def kv(key: str, value: Any, width: int = 12) -> None:
     print(f"{key:<{width}}: {_format_value(value)}", flush=True)
-
 
 def crypto_verdict(
     signature_valid: bool,
@@ -91,7 +82,6 @@ def crypto_verdict(
         f"session={'ACTIVE' if session_active else 'INACTIVE'}, "
         f"decrypt={'SUCCESS' if decrypt_ok else 'FAILED'}"
     )
-
 
 def ml_verdict(is_anomalous: bool, score: Any, reasons: Any = None) -> str:
     score_str = _format_value(score)
