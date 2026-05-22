@@ -37,10 +37,13 @@ Run from the repo root directory.
 """
 
 from __future__ import annotations
+
 from pathlib import Path
+
 from crypto.key_manager import KeyManager
 
 OUTDIR = Path("dev_secrets/groundstation")
+
 
 def main() -> None:
     OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -56,6 +59,7 @@ def main() -> None:
     print(f"  Private: {OUTDIR / 'receiver_kem_private.key'}  ← keep on Jetson only")
     print()
     print("Next step: copy receiver_kem_public.key to dev_secrets/satellite/ on the Pi.")
+
 
 if __name__ == "__main__":
     main()

@@ -76,9 +76,10 @@ AegisLEO/
 │   └── feature_logger.py      # ML training data collection (CSV)
 ├── adversary/          # Attack tools for detection pipeline testing
 │   ├── kali-inj-bridge.py     # Demo injection: spike / drift / flatline profiles
-│   ├── replay_attack.py        # Packet replay
-│   ├── packet_fuzzer.py        # Malformed frame injection
-│   └── mitm_proxy.py           # MITM proxy
+│   ├── replay_attack.py        # Packet replay (v2.0 stub)
+│   ├── packet_fuzzer.py        # Transport-layer frame fuzzer (v2.0 stub)
+│   ├── telemetry_sniffer.py    # Passive frame capture (v2.0 stub)
+│   └── mitm_proxy.py           # MITM proxy (v2.0 stub)
 ├── crypto/             # Post-quantum cryptographic primitives
 │   ├── pq_kem.py               # ML-KEM-1024 (FIPS 203)
 │   ├── mldsa_signatures.py     # ML-DSA-65 (FIPS 204)
@@ -148,11 +149,11 @@ python -m satellite.transmitter
 python -m groundstation.receiver
 ```
 
-**Adversary node (Kali VM):**
+**Adversary node (Kali VM — demo injection):**
 ```bash
 python adversary/kali-inj-bridge.py --profile spike
-python adversary/replay_attack.py
-python adversary/packet_fuzzer.py
+python adversary/kali-inj-bridge.py --profile drift
+python adversary/kali-inj-bridge.py --profile flatline
 ```
 
 ### Train the anomaly detector
