@@ -22,26 +22,20 @@ Notes
   before use as an AES key.
 """
 
+import base64
+import oqs
+from dataclasses import dataclass
 from __future__ import annotations
 
-import base64
-from dataclasses import dataclass
-
-import oqs
-
-
 DEFAULT_KEM_ALG = "ML-KEM-1024"
-
 
 def b64e(data: bytes) -> str:
     """Encode bytes as base64 text for JSON-friendly transport/storage."""
     return base64.b64encode(data).decode("utf-8")
 
-
 def b64d(data: str) -> bytes:
     """Decode base64 text back into bytes."""
     return base64.b64decode(data.encode("utf-8"))
-
 
 @dataclass
 class KEMKeyPair:
@@ -62,7 +56,6 @@ class KEMKeyPair:
     public_key: bytes
     private_key: bytes
 
-
 @dataclass
 class EncapsulationResult:
     """
@@ -77,11 +70,9 @@ class EncapsulationResult:
     shared_secret : bytes
         Shared secret derived during encapsulation
     """
-
     algorithm: str
     ciphertext: bytes
     shared_secret: bytes
-
 
 def generate_keypair(algorithm: str = DEFAULT_KEM_ALG) -> KEMKeyPair:
     """
@@ -106,7 +97,6 @@ def generate_keypair(algorithm: str = DEFAULT_KEM_ALG) -> KEMKeyPair:
             private_key=private_key,
         )
 
-
 def encapsulate(public_key: bytes, algorithm: str = DEFAULT_KEM_ALG) -> EncapsulationResult:
     """
     Encapsulate a shared secret to the recipient's public key.
@@ -130,7 +120,6 @@ def encapsulate(public_key: bytes, algorithm: str = DEFAULT_KEM_ALG) -> Encapsul
             ciphertext=ciphertext,
             shared_secret=shared_secret,
         )
-
 
 def decapsulate(ciphertext: bytes, private_key: bytes, algorithm: str = DEFAULT_KEM_ALG) -> bytes:
     """
