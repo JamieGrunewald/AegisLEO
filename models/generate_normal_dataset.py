@@ -1,3 +1,32 @@
+"""
+AegisLEO — Normal Telemetry Dataset Generator
+===============================================
+
+Created by: Jamie Grunewald
+Date: 2026-03-26
+Version: v0.1.0
+
+Purpose
+-------
+Generates a synthetic CSV dataset of nominal satellite telemetry for
+training the sequence autoencoder anomaly detector. Samples are drawn
+from the same deterministic generator used by the live transmitter
+(common/telemetry.py::sample_telemetry), with small random jitter added
+so the model learns a realistic distribution rather than a dead-flat signal.
+
+Output
+------
+groundstation/logs/telemetry_normal.csv — 2000 rows, one per telemetry sample.
+Columns match the feature vector defined in Telemetry.to_feature_dict().
+
+Usage
+-----
+    python -m models.generate_normal_dataset
+
+Run this once before training. The output CSV is consumed by
+models/train_seq_autoencoder.py via models/window_dataset.py.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -17,7 +46,8 @@ def main() -> None:
     for seq in range(1, ROWS_TO_GENERATE + 1):
         t = sample_telemetry(seq)
 
-        # Add tiny normal jitter so the model doesn't learn a dead-flat world.
+        # Add small random jitter so the model learns a realistic distribution
+        # rather than memorizing a perfectly repeating pattern.
         t = t.clone_with(
             temperature_c=t.temperature_c + random.uniform(-0.15, 0.15),
             bus_v=t.bus_v + random.uniform(-0.02, 0.02),
