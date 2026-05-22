@@ -53,13 +53,11 @@ What it does:
       ccsds/pq_sign.py
       crypto/pq_sign.py
     while keeping crypto/mldsa_signatures.py as the preferred implementation
-  - optionally renames:
-      groundstation/receiver.py -> groundstation/receiver_legacy.py
-      groundstation/receiver_secure.py -> groundstation/receiver.py
-      satellite/transmitter.py -> satellite/transmitter_legacy.py
-      satellite/transmitter_secure.py -> satellite/transmitter.py
-  - optionally moves:
-      liboqs-python -> third_party/liboqs-python
+  - optionally renames legacy receiver/transmitter files (--rename-legacy-flow)
+    Note: legacy rename was completed during initial cleanup; this flag is a no-op
+    on the current repo state but is retained for future refactoring cycles.
+  - optionally moves liboqs-python into third_party/ (--move-liboqs)
+    Note: liboqs-python is no longer vendored; install from source per docs/pqc_design.md.
 
 Recommended first run:
   bash tools/repo_cleanup.sh
