@@ -27,9 +27,7 @@ Used by
 """
 
 from __future__ import annotations
-
 import time
-
 
 class SessionState:
     """
