@@ -32,14 +32,12 @@ Satellite / sender flow:
 """
 
 from __future__ import annotations
-
 import base64
 import hashlib
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -51,11 +49,9 @@ from crypto.pq_kem import (
     generate_keypair,
 )
 
-
 def b64e(data: bytes) -> str:
     """Encode bytes as base64 text."""
     return base64.b64encode(data).decode("utf-8")
-
 
 def b64d(data: str) -> bytes:
     """Decode base64 text into bytes."""
@@ -96,7 +92,6 @@ def derive_aes256_key(
         info=info,
     )
     return hkdf.derive(shared_secret)
-
 
 @dataclass
 class SessionState:
@@ -157,39 +152,31 @@ class SessionState:
         self.highest_sequence_in = -1
         self.expires_at = 0.0
 
-
 @dataclass(frozen=True)
 class ReceiverBootstrap:
     """
     Receiver-side bootstrap material.
-
     This is created by the receiver/ground station and the public key is shared
     with the sender/satellite.
     """
-
     algorithm: str
     public_key: bytes
     private_key: bytes
-
 
 @dataclass(frozen=True)
 class InitiatorHandshake:
     """
     Initiator-side handshake output.
-
     The initiator derives the AES key locally and sends the KEM ciphertext to
     the responder so it can recover the same shared secret.
     """
-
     session: SessionState
     kem_ciphertext: bytes
-
 
 class KeyManager:
     """
     Manage PQ KEM bootstrapping and AES session establishment.
     """
-
     def __init__(
         self,
         algorithm: str = DEFAULT_KEM_ALG,
