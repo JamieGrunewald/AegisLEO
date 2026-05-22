@@ -25,13 +25,10 @@ Used by
 - groundstation/receiver.py   (logs each verified telemetry frame)
 - models/train_seq_autoencoder.py  (reads CSV for training)
 """
-
+from typing import Dict
 from __future__ import annotations
-
 import csv
 import os
-from typing import Dict
-
 
 class FeatureLogger:
     """
@@ -46,7 +43,6 @@ class FeatureLogger:
         Full path to the output CSV file.
         Example: "groundstation/logs/telemetry_normal.csv"
     """
-
     def __init__(self, csv_path: str) -> None:
         self.csv_path = csv_path
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
