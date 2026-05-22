@@ -787,6 +787,7 @@ while True:
 
                 detection = detector.detect(telemetry)
                 
+
                 print("=" * 72)
                 print("AegisLEO Secure Telemetry Packet")
                 print(f"Spacecraft : {frame['spacecraft_id']}")
@@ -809,7 +810,23 @@ while True:
 
                 print(f"Summary    : {telemetry.summary()}")
                 print("=" * 72)
+
                 send_ack(session_id, message_id)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
             except Exception as exc:
                 print(
                     f"[GROUND] REJECTED: telemetry processing failed "

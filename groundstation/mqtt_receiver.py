@@ -1,29 +1,41 @@
 """
-groundstation/mqtt_receiver.py
+AegisLEO — MQTT Ground Station Receiver (Early Prototype)
+===========================================================
 
-Subscribes to telemetry packets from MQTT and decodes them.
+Created by: Jamie Grunewald
+Date: 2026-03-08
+Version: v0.1.0 (historical)
 
-What we verify here:
-- Packet parse success
-- CRC32 matches (catches corruption/tamper)
+Purpose
+-------
+Early prototype of the ground station receiver using MQTT as the transport.
+Subscribes to a topic on an MQTT broker, receives binary telemetry packets
+published by satellite/mqtt_sender.py, and decodes them using the binary
+Packet format (common/protocol.py).
 
-What we do NOT do yet:
-- AES-GCM authentication
-- Dilithium signature verification
+This was developed alongside the UDP sender/receiver as an alternative
+transport exploration before the LoRa RF link was introduced.
 
-Those are the next layer and will fit cleanly because the MQTT payload is already binary.
+Status
+------
+Superseded by groundstation/receiver.py, which uses the LoRa serial link
+with byte-stuffed framing, ML-KEM session key exchange, ML-DSA-65 signature
+verification, AES-256-GCM decryption, replay protection, and ML anomaly
+detection. Retained here as a reference for the project's development history.
+
+Usage (historical)
+------------------
+    python -m groundstation.mqtt_receiver --host 127.0.0.1 --port 1883
 """
 
 from __future__ import annotations
 
 import argparse
 import signal
-import sys
-from typing import Optional
 
 import paho.mqtt.client as mqtt
 
-from common.packet import Packet, decode_telemetry_json
+from common.protocol import Packet, decode_telemetry_json
 
 
 def main() -> int:
@@ -51,11 +63,9 @@ def main() -> int:
         print(f"[groundstation] subscribed topic='{args.topic}' qos={args.qos}")
 
     def on_message(client, userdata, msg):
-        # msg.payload is bytes; exactly what satellite published.
         try:
             pkt = Packet.from_bytes(msg.payload)
             telemetry = decode_telemetry_json(pkt.payload)
-
             print(
                 f"[groundstation] topic={msg.topic} apid={pkt.apid} seq={pkt.seq} "
                 f"ts_ms={pkt.ts_ms} telemetry={telemetry}"
