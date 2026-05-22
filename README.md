@@ -212,6 +212,7 @@ pytest tests/ -v
 | [docs/architecture.md](docs/architecture.md) | System diagram, node roles, data flow, transport framing |
 | [docs/pqc_design.md](docs/pqc_design.md) | Algorithm selection, key lifecycle, threat model |
 | [docs/protocol_spec.md](docs/protocol_spec.md) | Packet types, session state machine, CCSDS alignment |
+| [docs/AegisLEO_CypherCon9_2026.pdf](docs/AegisLEO_CypherCon9_2026.pdf) | CypherCon 9 talk slides (April 2026, Milwaukee) |
 
 ---
 
