@@ -1,9 +1,9 @@
 """
-AegisLEO ML-DSA Signature Utilities (Noob-Friendly Version)
+AegisLEO Post-Quantum KEM Helpers
 
 Created by: Jamie Grunewald
-Version: v0.4.0
-
+Date: 2026-03-23
+Version: v0.1.0
 Purpose
 -------
 This file handles digital signatures using ML-DSA (post-quantum).
