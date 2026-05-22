@@ -28,12 +28,10 @@ v0.1.0  Initial dataclass with JSON serialization.
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass, asdict
+from typing import Any, Dict, List
 import json
 import time
-from typing import Any, Dict, List
-
 
 # ---------------------------------------------------------------------
 # Mode encoding (stable + extensible)
@@ -46,7 +44,6 @@ MODE_MAP = {
 }
 
 MODE_COUNT = len(MODE_MAP)
-
 
 # ---------------------------------------------------------------------
 # Telemetry dataclass
