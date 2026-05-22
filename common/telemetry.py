@@ -1,15 +1,30 @@
-# common/telemetry.py
-
 """
+AegisLEO — Telemetry Data Model
+================================
+
 Created by: Jamie Grunewald
 Date: 2026-03-26
-Version: v0.02.0
+Version: v0.2.0
 
-Enhancements:
-- Stable ML feature ordering
-- Mode encoded safely
-- Added anomaly mutation helpers
-- Added envelope validation hooks (for demo + ML explainability)
+Purpose
+-------
+Defines the Telemetry dataclass used throughout AegisLEO as the canonical
+representation of a satellite telemetry sample. Handles serialization,
+ML feature extraction, envelope validation, and adversary mutation helpers.
+
+Used by
+-------
+- satellite/transmitter.py       (generate + serialize samples)
+- groundstation/receiver.py      (deserialize + display samples)
+- models/runtime_detector.py     (feature vector input to autoencoder)
+- groundstation/feature_logger.py (CSV logging for training data)
+- adversary/kali-inj-bridge.py   (mutation for anomaly injection)
+
+Version History
+---------------
+v0.2.0  Stable ML feature ordering, one-hot mode encoding, clone_with helper,
+        validate_envelope hooks for demo explainability.
+v0.1.0  Initial dataclass with JSON serialization.
 """
 
 from __future__ import annotations
@@ -34,11 +49,42 @@ MODE_COUNT = len(MODE_MAP)
 
 
 # ---------------------------------------------------------------------
-# Telemetry Object
+# Telemetry dataclass
 # ---------------------------------------------------------------------
 
 @dataclass
 class Telemetry:
+    """
+    One satellite telemetry sample.
+
+    Fields match the synthetic generator in sample_telemetry() and the
+    payload schema in satellite/transmitter.py. The ML feature vector
+    order is fixed — do not reorder fields once a model is trained.
+
+    Attributes
+    ----------
+    seq : int
+        Packet sequence number.
+    timestamp : float
+        UNIX timestamp at sample time.
+    temperature_c : float
+        On-board temperature in degrees Celsius.
+    battery_pct : int
+        Battery state of charge (0–100%).
+    mode : str
+        Spacecraft operating mode: NOMINAL, SUNPOINT, or TX_WINDOW.
+    latitude : float
+        Ground track latitude (degrees).
+    longitude : float
+        Ground track longitude (degrees).
+    altitude_km : float
+        Orbital altitude in kilometres.
+    bus_v : float
+        Power bus voltage (volts).
+    bus_i : float
+        Power bus current (amps).
+    """
+
     seq: int
     timestamp: float
     temperature_c: float
@@ -66,7 +112,7 @@ class Telemetry:
         return Telemetry(**obj)
 
     # ---------------------------------------------------------
-    # Human-readable output (stage view)
+    # Human-readable output
     # ---------------------------------------------------------
 
     def summary(self) -> str:
@@ -82,6 +128,7 @@ class Telemetry:
         )
 
     def operator_lines(self) -> list[tuple[str, str]]:
+        """Key-value pairs for structured demo output via demo_log.kv()."""
         return [
             ("Sequence", str(self.seq)),
             ("Timestamp", f"{self.timestamp:.3f}"),
@@ -95,19 +142,21 @@ class Telemetry:
         ]
 
     # ---------------------------------------------------------
-    # ML Feature Extraction (ordered + stable)
+    # ML feature extraction
     # ---------------------------------------------------------
 
     def to_feature_vector(self) -> List[float]:
         """
-        Stable feature vector for ML model input.
+        Fixed-order numeric feature vector for autoencoder input.
 
-        IMPORTANT:
-        Order must NEVER change once model is trained.
+        Order: seq, temperature_c, battery_pct, latitude, longitude,
+               altitude_km, bus_v, bus_i, mode_nominal, mode_sunpoint,
+               mode_tx_window.
+
+        WARNING: This order must never change once a model is trained.
+        Changing it requires retraining from scratch.
         """
-
         mode_index = MODE_MAP.get(self.mode, -1)
-
         one_hot = [0.0] * MODE_COUNT
         if mode_index >= 0:
             one_hot[mode_index] = 1.0
@@ -125,63 +174,45 @@ class Telemetry:
         ]
 
     def to_feature_dict(self) -> Dict[str, float]:
-        """
-        Named version (useful for CSV logging / debugging)
-        """
+        """Named version of the feature vector — useful for CSV logging."""
         vec = self.to_feature_vector()
-
         keys = [
-            "seq",
-            "temperature_c",
-            "battery_pct",
-            "latitude",
-            "longitude",
-            "altitude_km",
-            "bus_v",
-            "bus_i",
-            "mode_nominal",
-            "mode_sunpoint",
-            "mode_tx_window",
+            "seq", "temperature_c", "battery_pct",
+            "latitude", "longitude", "altitude_km",
+            "bus_v", "bus_i",
+            "mode_nominal", "mode_sunpoint", "mode_tx_window",
         ]
-
         return dict(zip(keys, vec))
 
     # ---------------------------------------------------------
-    # Validation (for demo + explainability)
+    # Envelope validation
     # ---------------------------------------------------------
 
     def validate_envelope(self) -> list[str]:
         """
-        Returns list of violations.
-        Useful for:
-        - demo explanations
-        - ML reasoning display
+        Check telemetry values against physically plausible bounds.
+
+        Returns a list of violation strings (empty list = clean).
+        Used by the demo for human-readable anomaly explanation alongside
+        the autoencoder ThreatScore.
         """
-
         issues: list[str] = []
-
         if not (0 <= self.battery_pct <= 100):
             issues.append("battery_out_of_range")
-
         if not (3.0 <= self.bus_v <= 6.0):
             issues.append("bus_voltage_anomaly")
-
         if not (0.0 <= self.bus_i <= 2.0):
             issues.append("bus_current_anomaly")
-
         if not (-100 <= self.temperature_c <= 120):
             issues.append("temperature_unrealistic")
-
         return issues
 
     # ---------------------------------------------------------
-    # Mutation helper (for adversary simulation)
+    # Mutation helpers (adversary simulation)
     # ---------------------------------------------------------
 
     def mutate_for_attack(self) -> "Telemetry":
-        """
-        Generate a clearly anomalous version for testing detection.
-        """
+        """Return a clearly anomalous variant for testing detection pipeline."""
         return self.clone_with(
             temperature_c=85.0,
             bus_v=2.1,
@@ -191,6 +222,7 @@ class Telemetry:
         )
 
     def clone_with(self, **updates: Any) -> "Telemetry":
+        """Return a copy of this Telemetry with selected fields overridden."""
         data = self.to_dict()
         data.update(updates)
         return Telemetry(**data)
@@ -201,6 +233,13 @@ class Telemetry:
 # ---------------------------------------------------------------------
 
 def sample_telemetry(seq: int) -> Telemetry:
+    """
+    Generate a synthetic nominal telemetry sample for a given sequence number.
+
+    Values cycle through small deterministic variations to simulate a live
+    downlink. Used for training data generation and lab testing without
+    physical hardware.
+    """
     return Telemetry(
         seq=seq,
         timestamp=time.time(),

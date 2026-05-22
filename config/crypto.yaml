@@ -1,0 +1,25 @@
+# AegisLEO Cryptographic Configuration
+# -------------------------------------
+# These values are used by crypto/key_manager.py and related modules.
+# Key files (*.key, *.pem) are NOT stored here — see keys/ and dev_secrets/.
+
+kem:
+  algorithm: ML-KEM-1024        # FIPS 203 — post-quantum key encapsulation
+  hkdf_hash: SHA256
+  hkdf_info: "AegisLEO-session-key-v1"
+
+signatures:
+  algorithm: ML-DSA-65          # FIPS 204 — post-quantum digital signatures
+
+symmetric:
+  algorithm: AES-256-GCM
+  key_length_bytes: 32
+  nonce_length_bytes: 12
+
+key_paths:
+  # Satellite node
+  satellite_signing_secret: keys/satellite_mldsa_secret.key
+  satellite_signing_public: keys/satellite_mldsa_public.key
+  # Ground station
+  receiver_kem_public: dev_secrets/satellite/receiver_kem_public.key
+  receiver_kem_private: dev_secrets/groundstation/receiver_kem_private.key

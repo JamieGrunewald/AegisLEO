@@ -1,0 +1,38 @@
+# AegisLEO Telemetry Configuration
+# ----------------------------------
+# Nominal operating ranges for the synthetic telemetry model.
+# Used by common/telemetry.py and the autoencoder training pipeline.
+
+spacecraft_id: AegisLEO-SAT-1
+apid: 100
+
+nominal_ranges:
+  temperature_c:
+    min: 18.0
+    max: 28.0
+  battery_pct:
+    min: 85
+    max: 100
+  bus_v:
+    min: 4.8
+    max: 5.2
+  bus_i:
+    min: 0.35
+    max: 0.55
+  altitude_km:
+    min: 540.0
+    max: 560.0
+
+# Telemetry TTL — packets older than this are rejected
+telemetry_ttl_seconds: 8.0
+session_init_ttl_seconds: 600.0
+
+# Autoencoder anomaly threshold (set after training)
+# Override with value from models/seq_threshold.json after training
+anomaly_threshold: 0.05
+
+# ThreatScore weights
+threatscore:
+  crypto_weight: 0.6
+  ml_weight: 0.3
+  replay_weight: 0.1

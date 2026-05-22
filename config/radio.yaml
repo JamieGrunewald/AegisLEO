@@ -1,0 +1,25 @@
+# AegisLEO Radio Configuration
+# -----------------------------
+# LoRa serial link settings for Waveshare SX1262 HAT.
+# Adjust serial port paths per node.
+
+satellite:
+  serial_port: /dev/ttyACM0
+  baud_rate: 115200
+
+groundstation:
+  # Use by-id path for stable device naming across reboots
+  serial_port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AAF186928-if00
+  baud_rate: 115200
+
+link:
+  # LoRa DTU wire limit — do not exceed without adjusting chunk sizes
+  max_frame_bytes: 240
+  session_init_chunk_size: 160    # bytes (uncompressed JSON)
+  telemetry_chunk_size: 110       # bytes (uncompressed JSON)
+  session_init_chunk_delay: 0.35  # seconds between chunks
+  telemetry_chunk_delay: 0.35     # seconds between chunks
+  ack_wait_seconds: 50.0
+  session_init_listen_cycles: 32
+  telemetry_max_cycles: 14
+  telemetry_max_quiet_cycles: 3

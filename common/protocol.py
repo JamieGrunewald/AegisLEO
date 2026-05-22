@@ -1,36 +1,48 @@
 """
-common/packet.py
+AegisLEO — Binary Packet Protocol
+===================================
+
+Created by: Jamie Grunewald
+Date: 2026-03-08
+Version: v0.1.0
 
 Purpose
 -------
-Defines a simple, CCSDS-inspired packet format for our Satellite Lab demo.
-This is NOT a full CCSDS implementation, but it gives us:
-- a structured header (routing + sequence + timestamp)
-- a payload (JSON telemetry bytes for now)
-- a CRC32 check to detect tampering/corruption before crypto is added
+Defines a simple CCSDS-inspired binary packet format used in early AegisLEO
+development. This is NOT a full CCSDS implementation, but provides:
+- a structured header (routing, sequence, timestamp)
+- a payload (JSON telemetry bytes)
+- a CRC32 integrity check
+
+Note: The active transmitter/receiver pipeline (satellite/transmitter.py and
+groundstation/receiver.py) uses the JSON-over-LoRa transport in ccsds/frame.py
+rather than this binary format. This module is retained as reference and is
+used by the test suite (tests/test_packet.py).
 
 Why a custom packet format?
---------------------------
-For a realistic demo, we want something more "space-ish" than raw JSON, and we want:
+---------------------------
+For a realistic demo we want something more "space-ish" than raw JSON, with:
 - deterministic parsing (binary header)
 - easy logging (apid, seq, timestamp)
-- integrity checks (CRC, later AES-GCM authentication)
+- integrity checks (CRC32, later superseded by AES-GCM authentication)
 
 Header layout (network byte order / big-endian)
 -----------------------------------------------
-SYNC (2 bytes)      : "SL"  -> helps us quickly reject random bytes
-VERSION (1 byte)    : format version
-FLAGS (1 byte)      : feature bits (unused for now, but reserved)
-APID (2 bytes)      : Application ID (think "subsystem ID")
-SEQ (4 bytes)       : packet sequence number
-TS_MS (4 bytes)     : timestamp in milliseconds (truncated to 32-bit)
-PAYLOAD_LEN (4)     : payload length in bytes
-CRC32 (4 bytes)     : CRC of (header-with-crc=0 + payload)
+SYNC (2 bytes)       : "SL" magic — quickly rejects random bytes
+VERSION (1 byte)     : format version
+FLAGS (1 byte)       : feature bits (reserved, currently 0)
+APID (2 bytes)       : Application Process ID (subsystem identifier)
+SEQ (4 bytes)        : packet sequence number
+TS_MS (4 bytes)      : timestamp in milliseconds (32-bit truncated)
+PAYLOAD_LEN (4 bytes): payload length in bytes
+CRC32 (4 bytes)      : CRC of (header-with-crc=0 + payload)
 
-Total header size = 22 bytes.
+Total header size: 22 bytes.
 
-Note: CRC32 is not cryptographic integrity. It's a fast corruption/tamper tripwire.
-Once we add AES-GCM, we get cryptographic authentication too.
+CRC32 is not a cryptographic primitive — it catches corruption and
+accidental tampering. AES-256-GCM (crypto/aes_gcm.py) provides
+cryptographic authentication in the live pipeline.
+"""
 """
 
 from __future__ import annotations

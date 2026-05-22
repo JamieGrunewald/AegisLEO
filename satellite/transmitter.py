@@ -4,17 +4,6 @@ Transport-Hardened RF Version with Selective session_init Recovery
 
 Created by: Jamie Grunewald
 Date: 2026-03-26
-<<<<<<< HEAD
-Version: v0.12.0
-
-What changed in v0.12.0
------------------------
-1. Fixed telemetry object usage in the main TX loop
-2. Standardized startup and TX logging with dlog/banner/kv
-3. Corrected telemetry packet-size debug logging
-4. Added clearer comments for learning and stage-demo readability
-5. Kept transport behavior the same to avoid destabilizing the working baseline
-=======
 Version: v0.13.0
 
 What changed in v0.13.0
@@ -26,7 +15,6 @@ What changed in v0.13.0
 5. Byte-stuffed length field in write_transport_packet so 0x7E/0x7F
    never appear raw in the length field and cause framing misalignment
 6. Matching byte-unstuffing in extract_framed_packets for ACK/NACK parsing
->>>>>>> demo-final
 """
 
 from __future__ import annotations
@@ -63,27 +51,14 @@ APID = 100
 # ---------------------------------------------------------------------
 # Chunking / pacing
 # ---------------------------------------------------------------------
-<<<<<<< HEAD
-SESSION_INIT_CHUNK_SIZE = 220
-TELEMETRY_CHUNK_SIZE = 140
-=======
 SESSION_INIT_CHUNK_SIZE = 160
 TELEMETRY_CHUNK_SIZE = 110
->>>>>>> demo-final
 
 SESSION_INIT_CHUNK_DELAY_SECONDS = 0.35
 TELEMETRY_CHUNK_DELAY_SECONDS = 0.35
 
 ACK_WAIT_SECONDS = 50.0
 
-<<<<<<< HEAD
-# ---------------------------------------------------------------------
-# Framing markers used over the serial link
-# ---------------------------------------------------------------------
-FRAME_START = b"\x7E"
-FRAME_END = b"\x7F"
-
-=======
 # Session-init and telemetry need different patience profiles.
 SESSION_INIT_LISTEN_CYCLES = 32
 
@@ -130,7 +105,6 @@ FRAME_END = b"\x7F"
 FRAME_ESC     = 0x7D   # escape byte — signals that the next byte is stuffed
 FRAME_ESC_XOR = 0x20   # XOR mask applied to the original byte after escaping
 
->>>>>>> demo-final
 # ---------------------------------------------------------------------
 # Debug flags
 # ---------------------------------------------------------------------
@@ -339,12 +313,6 @@ def _unstuff_length(buf: bytearray, start: int) -> tuple[int | None, int]:
 
 def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     """
-<<<<<<< HEAD
-    Send one transport packet using the framing the receiver expects.
-
-    Wire format:
-        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
-=======
     Serialize and send one transport chunk packet over the serial link.
 
     Wire format
@@ -365,7 +333,6 @@ def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     pkt : dict
         The transport chunk packet to send. Contains fields like
         t, sid, i, n, d, c, and optionally mid.
->>>>>>> demo-final
     """
     # Compact JSON — no extra spaces, smallest possible wire footprint.
     payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
@@ -378,12 +345,8 @@ def write_transport_packet(ser: serial.Serial, pkt: dict[str, Any]) -> None:
     ser.write(wire)
     ser.flush()
 
-<<<<<<< HEAD
-    # Tiny pause to reduce back-to-back serial flooding.
-=======
     # Tiny pause to prevent back-to-back writes from overflowing the
     # SX1262 module's serial input buffer on the LoRa side.
->>>>>>> demo-final
     time.sleep(0.02)
 
 
@@ -416,37 +379,17 @@ def send_chunk_packets(
                 idx=f"{idx + 1}/{total}",
             )
 
-<<<<<<< HEAD
-        # Telemetry gets gentler pacing than session init because it is
-        # the repeated data path and can otherwise overwhelm RX.
-        if pkt["t"] == "tc":
-            # Brief processing gap every few telemetry chunks.
-            if idx > 0 and idx % 5 == 0:
-                time.sleep(0.25)
-
-            time.sleep((delay_seconds * 2.5) + random.uniform(0.005, 0.02))
-=======
         if pkt["t"] == "tc":
             # Pacing tuned to LoRa SF7/BW125 airtime (~276ms per chunk).
             # delay_seconds = 0.35 gives airtime + 50ms margin.
             # Small jitter prevents lock-step RF collisions.
             time.sleep(delay_seconds + random.uniform(0.01, 0.03))
->>>>>>> demo-final
         else:
             time.sleep(delay_seconds + random.uniform(0.005, 0.02))
 
 
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     """
-<<<<<<< HEAD
-    Extract complete framed packets from the receive buffer.
-
-    Expected frame format:
-        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
-
-    This is used on the transmitter side to parse ACK/NACK control traffic
-    coming back from the ground station.
-=======
     Extract complete framed packets from the raw serial receive buffer.
 
     This is used on the TRANSMITTER side to parse ACK/NACK control
@@ -475,7 +418,6 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
     length, wrong end marker), it drops ONE byte and tries again from
     the next position. This means a single corrupted byte causes at most
     one frame to be lost — not a full buffer wipe.
->>>>>>> demo-final
     """
     frames: list[bytes] = []
 
@@ -505,31 +447,15 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
         # Returns (None, 0) if the buffer is too short to read it fully.
         payload_len, len_consumed = _unstuff_length(buffer, 1)
 
-<<<<<<< HEAD
-        if payload_len <= 0 or payload_len > 4096:
-            if DEBUG_BAD_FRAMES:
-                dlog("SAT", "WARN", "Invalid frame length while resyncing", payload_len=payload_len)
-            del buffer[0]
-            continue
-
-        total_len = 1 + 4 + payload_len + 1
-
-        if len(buffer) < total_len:
-=======
         if payload_len is None:
             # Haven't received all the length bytes yet — wait for more.
->>>>>>> demo-final
             break
 
         if payload_len <= 0 or payload_len > 4096:
             # Length value is out of range — this is not a valid frame.
             # Drop one byte and search for the next FRAME_START.
             if DEBUG_BAD_FRAMES:
-<<<<<<< HEAD
-                dlog("SAT", "WARN", "Bad frame end marker while resyncing", end_marker=repr(end_marker))
-=======
                 dlog("SAT", "WARN", "Invalid frame length while resyncing", payload_len=payload_len)
->>>>>>> demo-final
             del buffer[0]
             continue
 
@@ -636,109 +562,18 @@ def control_matches_session(control: dict[str, Any], session_id: str, message_id
     return control_mid == message_id
 
 
-<<<<<<< HEAD
-def wait_for_ack_or_nack(
-=======
 def wait_for_session_init_ack_or_nack(
->>>>>>> demo-final
     ser: serial.Serial,
     session_id: str,
     pending_chunks: list[dict[str, Any]],
     resend_delay_seconds: float,
 ) -> bool:
     """
-<<<<<<< HEAD
-    Wait for ACK/NACK and selectively recover missing chunks.
-
-    Behavior differs slightly by message type:
-    - session_init: quieter, listen-first recovery loop
-    - telemetry: simpler retry loop
-=======
     Wait for session-init ACK/NACK and selectively recover missing chunks.
->>>>>>> demo-final
     """
     seen_nack = False
 
-<<<<<<< HEAD
-    # -------------------------------------------------------------
-    # SESSION INIT PATH
-    # -------------------------------------------------------------
-    if message_id is None:
-        session_listen_cycles = 16
-        seen_nack = False
-
-        for cycle in range(1, session_listen_cycles + 1):
-            control = read_control_packet(ser, ACK_WAIT_SECONDS)
-
-            if control is not None and DEBUG_ACKS:
-                dlog("SAT", "CTRL_RX", "Received control packet", pkt=control)
-
-            if control is None:
-                dlog(
-                    "SAT",
-                    "ACK_WAIT",
-                    "Session-init quiet timeout",
-                    sid=session_id,
-                    cycle=f"{cycle}/{session_listen_cycles}",
-                )
-
-                # Rare nudge resends before the first valid NACK.
-                if not seen_nack and cycle in {6, 10}:
-                    dlog("SAT", "RECOVERY", "Pre-NACK resend-all burst", sid=session_id)
-                    time.sleep(2.5)
-                    send_chunk_packets(ser, pending_chunks, resend_delay_seconds)
-                    time.sleep(2.5)
-
-                continue
-
-            if not control_matches_session(control, session_id, message_id):
-                if DEBUG_ACKS:
-                    dlog(
-                        "SAT",
-                        "CTRL_IGNORE",
-                        "Ignoring control for different session/message",
-                        sid=control.get("sid"),
-                        mid=control.get("mid"),
-                    )
-                continue
-
-            control_type = control.get("t")
-
-            if control_type == "ack":
-                dlog("SAT", "ACK", "Session-init acknowledged", sid=session_id)
-                return True
-
-            if control_type == "nack":
-                missing = control.get("m", [])
-                dlog(
-                    "SAT",
-                    "NACK",
-                    "Session-init missing chunks reported",
-                    sid=session_id,
-                    missing=missing,
-                    cycle=f"{cycle}/{session_listen_cycles}",
-                )
-
-                seen_nack = True
-                time.sleep(0.5)
-                resend_missing_chunks(
-                    ser=ser,
-                    pending_chunks=pending_chunks,
-                    missing=missing,
-                    delay_seconds=resend_delay_seconds,
-                )
-                time.sleep(4.0)
-                continue
-
-        return False
-
-    # -------------------------------------------------------------
-    # TELEMETRY PATH
-    # -------------------------------------------------------------
-    for attempt in range(1, MAX_RETRIES + 1):
-=======
     for cycle in range(1, SESSION_INIT_LISTEN_CYCLES + 1):
->>>>>>> demo-final
         control = read_control_packet(ser, ACK_WAIT_SECONDS)
 
         if control is not None and DEBUG_ACKS:
@@ -748,16 +583,9 @@ def wait_for_session_init_ack_or_nack(
             dlog(
                 "SAT",
                 "ACK_WAIT",
-<<<<<<< HEAD
-                "Telemetry ACK timeout",
-                sid=session_id,
-                mid=message_id,
-                attempt=f"{attempt}/{MAX_RETRIES}",
-=======
                 "Session-init quiet timeout",
                 sid=session_id,
                 cycle=f"{cycle}/{SESSION_INIT_LISTEN_CYCLES}",
->>>>>>> demo-final
             )
 
             # Rare nudge resends before the first valid NACK.
@@ -769,11 +597,7 @@ def wait_for_session_init_ack_or_nack(
 
             continue
 
-<<<<<<< HEAD
-        if not control_matches_session(control, session_id, message_id):
-=======
         if not control_matches_session(control, session_id, None):
->>>>>>> demo-final
             if DEBUG_ACKS:
                 dlog(
                     "SAT",
@@ -784,15 +608,10 @@ def wait_for_session_init_ack_or_nack(
                 )
             continue
 
-<<<<<<< HEAD
-        if control.get("t") == "ack":
-            dlog("SAT", "ACK", "Telemetry acknowledged", sid=session_id, mid=message_id)
-=======
         control_type = control.get("t")
 
         if control_type == "ack":
             dlog("SAT", "ACK", "Session-init acknowledged", sid=session_id)
->>>>>>> demo-final
             return True
 
         if control_type == "nack":
@@ -800,25 +619,6 @@ def wait_for_session_init_ack_or_nack(
             dlog(
                 "SAT",
                 "NACK",
-<<<<<<< HEAD
-                "Telemetry missing chunks reported",
-                sid=session_id,
-                mid=message_id,
-                missing=missing,
-            )
-            time.sleep(0.5)
-            resend_missing_chunks(
-                ser=ser,
-                pending_chunks=pending_chunks,
-                missing=missing,
-                delay_seconds=resend_delay_seconds,
-            )
-            time.sleep(1.0)
-
-    return False
-
-
-=======
                 "Session-init missing chunks reported",
                 sid=session_id,
                 missing=missing,
@@ -965,7 +765,6 @@ def wait_for_telemetry_ack_or_nack(
     return False
 
 
->>>>>>> demo-final
 # ---------------------------------------------------------------------
 # Load long-term keys and initialize secure session
 # ---------------------------------------------------------------------
@@ -1055,11 +854,7 @@ dlog(
 # Give the half-duplex link time to flip from TX to RX cleanly.
 time.sleep(2.5)
 
-<<<<<<< HEAD
-session_init_ok = wait_for_ack_or_nack(
-=======
 session_init_ok = wait_for_session_init_ack_or_nack(
->>>>>>> demo-final
     ser=ser,
     session_id=session.session_id,
     pending_chunks=session_init_chunks,
@@ -1166,7 +961,6 @@ while True:
             chunk_size=TELEMETRY_CHUNK_SIZE,
         )
 
-    # Short pause before listening for ACK/NACK response.
     time.sleep(1.0)
 
     delivery_ok = wait_for_telemetry_ack_or_nack(
@@ -1178,16 +972,12 @@ while True:
     )
 
     if not delivery_ok:
-<<<<<<< HEAD
-        dlog("SAT", "DELIVERY_FAIL", "Telemetry delivery failed after retries", seq=sequence)
-=======
         dlog(
             "SAT",
             "DELIVERY_FAIL",
             "Telemetry delivery failed after recovery window",
             seq=sequence,
         )
->>>>>>> demo-final
     else:
         dlog("SAT", "DELIVERY_OK", "Telemetry acknowledged by ground station", seq=sequence)
 

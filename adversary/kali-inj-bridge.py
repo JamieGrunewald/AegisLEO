@@ -1,49 +1,43 @@
 """
-AegisLEO Demo — Kali Adversary Injection Script
-================================================
-Scenario: Kali is on the same VLAN as the Orin ground station.
-          Network has been "penetrated." Kali injects crafted
-          telemetry packets directly at the ground station's
-          serial-to-network bridge — or more simply, sends
-          malformed data that mimics the LoRa framing format
-          to a local forwarding socket.
+AegisLEO — Kali Adversary Injection Bridge
+============================================
 
-For the demo, this script takes the simpler and more reliable
-approach: it connects to a thin TCP bridge running on the Orin
-that forwards bytes to the receiver's serial buffer, OR it
-writes directly to a named pipe / Unix socket that the receiver
-reads from.
+Created by: Jamie Grunewald
+Date: 2026-03-26
+Version: v0.1.0
 
-SIMPLEST DEMO PATH:
-    Run this on Kali (or any box on the VLAN).
-    It sends a crafted telemetry JSON that bypasses LoRa
-    and hits the receiver's network-exposed debug port.
+Purpose
+-------
+Simulates an adversary node (Kali Linux VM on the same VLAN as the Jetson
+ground station) injecting crafted telemetry packets into the AegisLEO
+detection pipeline. Connects to a TCP bridge on the Orin that forwards
+bytes into the receiver's serial buffer.
 
-    Since the receiver uses serial, the realistic attack
-    vector is: Kali ARP spoofs the Orin, intercepts the
-    MQTT/TCP telemetry feed, and replays modified packets.
+This script was developed for the CypherCon 9 live demo to show the
+detection pipeline catching adversarial packets at two layers:
+  1. Crypto layer  — ML-DSA-65 signature is invalid (Kali has no satellite
+                     private key), so the receiver rejects immediately.
+  2. ML layer      — Autoencoder reconstruction error spikes on anomalous
+                     sensor values even in bypass/test mode.
 
-    For the demo we simulate this by running a local injector
-    on the Orin itself (or via SSH from Kali) that writes
-    crafted frames directly to the receiver's stdin/socket.
+Attack Profiles
+---------------
+spike    : Thermal spike (85C) + undervoltage + battery drain
+drift    : Subtle orbital drift + gradual power degradation
+flatline : All-zero sensor values (dead satellite spoof)
 
-WHAT THIS DEMONSTRATES:
-    1. Crypto layer: signature=INVALID (Kali can't sign with
-       the satellite's ML-DSA-65 private key)
-    2. ML layer: ANOMALY detected — autoencoder reconstruction
-       error spikes on anomalous sensor values even before
-       crypto verification
+Usage
+-----
+    # Run on Kali or locally on Orin:
+    python3 adversary/kali-inj-bridge.py --host 127.0.0.1 --port 5555 --profile spike
 
-Usage:
-    # On Kali (SSH into Orin or run locally):
-    python3 kali_inject.py --target 192.168.60.X --port 5555
+    # Inject via serial directly:
+    python3 adversary/kali-inj-bridge.py --serial /dev/ttyACM0 --profile flatline
 
-    # Or run locally on Orin for demo:
-    python3 kali_inject.py --local
-
-Requirements:
-    pip install paho-mqtt  (if using MQTT mode)
-    Standard library only for direct mode.
+Note
+----
+tcp-inj-bridge.py is an alias for this file retained for naming clarity
+during development. kali-inj-bridge.py is the canonical version.
 """
 
 from __future__ import annotations
