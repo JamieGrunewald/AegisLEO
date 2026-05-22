@@ -1,7 +1,9 @@
 # AegisLEO Telemetry Configuration
 # ----------------------------------
-# Nominal operating ranges for the synthetic telemetry model.
-# Used by common/telemetry.py and the autoencoder training pipeline.
+# Status: v2.0 planned — not yet loaded by any module at runtime.
+# Nominal ranges and thresholds are currently hardcoded in common/telemetry_model.py
+# and models/runtime_detector.py.
+# Update anomaly_threshold here after running models/train_seq_autoencoder.py.
 
 spacecraft_id: AegisLEO-SAT-1
 apid: 100

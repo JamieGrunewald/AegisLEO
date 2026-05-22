@@ -30,7 +30,7 @@ from typing import Any
 import serial
 
 from common.demo_log import dlog, banner, kv
-from common.telemetry import sample_telemetry
+from common.telemetry_model import sample_telemetry
 from ccsds.frame import build_frame, canonical_json_bytes
 from crypto.aes_gcm import encrypt
 from crypto.key_manager import KeyManager

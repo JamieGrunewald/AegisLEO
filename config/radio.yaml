@@ -1,7 +1,9 @@
 # AegisLEO Radio Configuration
 # -----------------------------
-# LoRa serial link settings for Waveshare SX1262 HAT.
-# Adjust serial port paths per node.
+# Status: v2.0 planned — not yet loaded by any module at runtime.
+# satellite/transmitter.py and groundstation/receiver.py use hardcoded constants.
+# This file documents intended config values for the v2.0 RadioConfig loader.
+# See also: radio/radio_config.py (planned YAML loader)
 
 satellite:
   serial_port: /dev/ttyACM0

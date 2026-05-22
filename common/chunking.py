@@ -13,13 +13,18 @@ SX1262 LoRa DTU wire limit (~240 bytes per frame). Each chunk is a self-
 contained JSON envelope carrying its index, total count, session ID, and
 a CRC32 for corruption detection.
 
-The receiver (groundstation/reassembly.py) collects all chunks for a given
-message ID and reassembles them before decryption and signature verification.
+Status
+------
+This module is not currently imported by the active pipeline.
+satellite/transmitter.py defines its own inline make_chunk_packets() function,
+and groundstation/reassembly.py handles reassembly independently. This module
+was developed as a shared utility and is intended to replace both inline
+implementations during a v2.0 refactor.
 
-Used by
--------
-- satellite/transmitter.py    (split session_init and telemetry packets)
-- groundstation/reassembly.py (reassemble chunks into full packets)
+Planned use (v2.0)
+------------------
+- satellite/transmitter.py    (replace inline make_chunk_packets)
+- groundstation/reassembly.py (shared chunk envelope format reference)
 """
 
 from __future__ import annotations

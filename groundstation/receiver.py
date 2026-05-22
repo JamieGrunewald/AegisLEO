@@ -50,7 +50,7 @@ from common.demo_log import (
     banner,
     kv,
 )
-from common.telemetry import Telemetry
+from common.telemetry_model import Telemetry
 
 import serial
 

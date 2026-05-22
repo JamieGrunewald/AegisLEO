@@ -86,7 +86,15 @@ AegisLEO/
 │   ├── aes_gcm.py              # AES-256-GCM
 │   └── key_manager.py          # Session key establishment + HKDF
 ├── ccsds/              # CCSDS Space Packet Protocol framing
-├── common/             # Shared: telemetry model, chunking, protocol, logging
+│   ├── frame.py                # Active: frame build/parse, canonical JSON
+│   ├── packet.py               # Compatibility shim → re-exports frame.py
+│   ├── ccsds_telemetry.py      # CCSDS telemetry type definitions (v2.0 stub)
+│   └── telemetry_builder.py    # Typed frame builder (v2.0 stub)
+├── common/             # Shared utilities
+│   ├── telemetry_model.py      # Telemetry dataclass (ML features, validation, mutation)
+│   ├── demo_log.py             # Structured demo output helpers
+│   ├── protocol.py             # Binary packet protocol (early prototype)
+│   └── chunking.py             # Chunk envelope helpers (v2.0 planned)
 ├── models/             # Anomaly detection
 │   ├── generate_normal_dataset.py  # Synthetic training data generator
 │   ├── window_dataset.py           # Sliding window dataset builder
@@ -96,7 +104,7 @@ AegisLEO/
 ├── experiments/        # PQC benchmarks, LoRa throughput, packet sizing
 ├── tools/              # Key generation, session bootstrap, inspection utilities
 ├── tests/              # pytest suite
-├── config/             # Runtime configuration (crypto, radio, telemetry)
+├── config/             # Runtime configuration YAMLs (v2.0 — not yet loaded at runtime)
 └── docs/               # Architecture, PQC design, protocol spec
 ```
 
@@ -180,9 +188,13 @@ pytest tests/ -v
 
 **In progress (stubs in repo):**
 - [ ] `radio/lora_serial.py` — LoRa serial abstraction layer for HackRF/RTL-SDR migration
-- [ ] `groundstation/reassembly.py` → `ReassemblyFactory` extraction and standalone testing
+- [ ] `radio/radio_config.py` — YAML config loader (replaces hardcoded constants in transmitter/receiver)
 - [ ] `models/telemetry_anomaly_model.py` — unified model interface replacing rule-based detector
 - [ ] `models/training_pipeline.py` — end-to-end training orchestration script
+- [ ] `common/chunking.py` — shared chunk envelope utility (replaces inline logic in transmitter)
+- [ ] `crypto/session_state.py` — consolidate SessionState (currently defined inline in key_manager.py)
+- [ ] `ccsds/ccsds_telemetry.py` — formal CCSDS telemetry type definitions
+- [ ] `config/` — wire YAML config loader so runtime values come from config files
 
 **Planned:**
 - [ ] Replace SX1262 LoRa with HackRF One (TX) + RTL-SDR v4 (RX) for over-the-air RF testing

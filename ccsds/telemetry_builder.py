@@ -30,8 +30,8 @@ Planned interface
 See also
 --------
 - ccsds/frame.py          — current active frame builder
-- ccsds/telemetry.py      — planned CCSDS telemetry type definitions
-- common/telemetry.py     — Telemetry dataclass (ML feature extraction)
+- ccsds/ccsds_telemetry.py      — planned CCSDS telemetry type definitions
+- common/telemetry_model.py     — Telemetry dataclass (ML feature extraction)
 - docs/protocol_spec.md   — packet format specification
 """
 

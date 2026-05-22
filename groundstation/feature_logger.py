@@ -18,7 +18,7 @@ models/train_seq_autoencoder.py to train the anomaly detection autoencoder.
 Output
 ------
 groundstation/logs/telemetry_normal.csv (path configured at instantiation)
-Columns match Telemetry.to_feature_dict() — see common/telemetry.py.
+Columns match Telemetry.to_feature_dict() — see common/telemetry_model.py.
 
 Used by
 -------

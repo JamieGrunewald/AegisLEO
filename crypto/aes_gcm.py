@@ -27,9 +27,12 @@ For now:
 Later:
 - ML-KEM (FIPS 203) will establish the session key properly
 """
+
 from __future__ import annotations
+
 import os
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 
 def generate_key() -> bytes:
     """
@@ -46,9 +49,11 @@ def generate_key() -> bytes:
     """
     return AESGCM.generate_key(bit_length=256)
 
+
 def encrypt(plaintext: bytes, key: bytes, aad: bytes | None = None) -> dict[str, bytes]:
     """
     Encrypt plaintext using AES-256-GCM.
+
     Parameters
     ----------
     plaintext : bytes
@@ -98,6 +103,7 @@ def encrypt(plaintext: bytes, key: bytes, aad: bytes | None = None) -> dict[str,
         "ciphertext": ciphertext,
     }
 
+
 def decrypt(nonce: bytes, ciphertext: bytes, key: bytes, aad: bytes | None = None) -> bytes:
     """
     Decrypt AES-256-GCM ciphertext.
@@ -106,10 +112,13 @@ def decrypt(nonce: bytes, ciphertext: bytes, key: bytes, aad: bytes | None = Non
     ----------
     nonce : bytes
         The nonce used during encryption.
+
     ciphertext : bytes
         The encrypted data including the GCM authentication tag.
+
     key : bytes
         The same AES key used for encryption.
+
     aad : bytes | None
         Must match the AAD used during encryption exactly.
 

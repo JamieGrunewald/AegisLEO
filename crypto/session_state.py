@@ -4,7 +4,18 @@ AegisLEO — Session State
 
 Created by: Jamie Grunewald
 Date: 2026-03-23
-Version: v0.1.0
+Version: v0.1.0 (orphaned — see note below)
+
+Status
+------
+This module is not currently imported by any active pipeline code.
+crypto/key_manager.py defines its own inline SessionState class that is
+used throughout the active transmitter and receiver. This standalone module
+was developed in parallel and was intended to replace the inline definition
+during a refactoring pass that has not yet occurred.
+
+Planned use: v2.0 refactor will consolidate both definitions here and have
+key_manager.py import from this module.
 
 Purpose
 -------
@@ -16,18 +27,16 @@ A new SessionState is created at the start of each session after the
 ML-KEM key exchange completes. It is held in memory only and never
 persisted to disk.
 
-Note: In the current pipeline, session state is managed directly inside
-groundstation/receiver.py and satellite/transmitter.py. This class is
-available for future refactoring into a dedicated session manager.
-
-Used by
--------
-- crypto/key_manager.py   (creates SessionState after KEM exchange)
+Used by (planned)
+-----------------
+- crypto/key_manager.py   (currently defines its own inline SessionState)
 - tests/test_session_key_pipeline.py
 """
 
 from __future__ import annotations
+
 import time
+
 
 class SessionState:
     """

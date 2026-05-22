@@ -11,7 +11,7 @@ Purpose
 Generates a synthetic CSV dataset of nominal satellite telemetry for
 training the sequence autoencoder anomaly detector. Samples are drawn
 from the same deterministic generator used by the live transmitter
-(common/telemetry.py::sample_telemetry), with small random jitter added
+(common/telemetry_model.py::sample_telemetry), with small random jitter added
 so the model learns a realistic distribution rather than a dead-flat signal.
 
 Output
@@ -33,7 +33,7 @@ import csv
 import os
 import random
 
-from common.telemetry import sample_telemetry
+from common.telemetry_model import sample_telemetry
 
 OUTPUT_PATH = "groundstation/logs/telemetry_normal.csv"
 ROWS_TO_GENERATE = 2000

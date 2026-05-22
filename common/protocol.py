@@ -43,8 +43,10 @@ CRC32 is not a cryptographic primitive — it catches corruption and
 accidental tampering. AES-256-GCM (crypto/aes_gcm.py) provides
 cryptographic authentication in the live pipeline.
 """
+"""
 
 from __future__ import annotations
+
 import json
 import struct
 import time
@@ -87,6 +89,7 @@ class Packet:
     payload : bytes
         Payload bytes. For now, JSON-encoded telemetry.
     """
+
     apid: int
     seq: int
     ts_ms: int
@@ -96,12 +99,12 @@ class Packet:
     def to_bytes(self) -> bytes:
         """
         Serialize Packet -> bytes, including CRC32.
+
         Implementation detail:
         - We pack the header with CRC=0 first
         - Compute CRC32 over (header_with_crc_zero + payload)
         - Pack header again with real CRC
         """
-        
         hdr_wo_crc = struct.pack(
             _HDR_FMT,
             SYNC,
@@ -113,6 +116,7 @@ class Packet:
             len(self.payload) & 0xFFFFFFFF,
             0,  # CRC placeholder
         )
+
         crc = zlib.crc32(hdr_wo_crc + self.payload) & 0xFFFFFFFF
 
         hdr = struct.pack(
@@ -126,6 +130,7 @@ class Packet:
             len(self.payload) & 0xFFFFFFFF,
             crc,
         )
+
         return hdr + self.payload
 
     @staticmethod
@@ -172,25 +177,32 @@ class Packet:
 
         if calc != crc:
             raise ValueError(f"crc mismatch: got {crc:#x}, calc {calc:#x}")
+
         return Packet(apid=apid, seq=seq, ts_ms=ts_ms, flags=flags, payload=payload)
+
 
 def now_ms() -> int:
     """
     Current UNIX time in milliseconds.
+
     We truncate to 32-bit to keep the header compact (like embedded systems often do).
     """
     return int(time.time() * 1000) & 0xFFFFFFFF
 
+
 def encode_telemetry_json(obj: Dict[str, Any]) -> bytes:
     """
     Encode a telemetry dict into bytes.
+
     We use compact JSON to reduce size and keep deterministic ordering.
     """
     return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
+
 def decode_telemetry_json(payload: bytes) -> Dict[str, Any]:
     """Decode telemetry JSON bytes back into a dict."""
     return json.loads(payload.decode("utf-8"))
+
 
 # --- Optional stream framing helpers ---
 # UDP preserves message boundaries, so you do NOT need these for UDP.
@@ -202,15 +214,17 @@ def frame(packet_bytes: bytes) -> bytes:
     """
     return struct.pack("!I", len(packet_bytes)) + packet_bytes
 
+
 def deframe(buffer: bytes) -> Tuple[bytes, bytes]:
     """
     Extract one length-prefixed packet from a TCP buffer.
+
     Returns:
         (one_packet_bytes, remainder_bytes)
+
     Raises:
         ValueError if we don't have enough bytes yet.
     """
-    
     if len(buffer) < 4:
         raise ValueError("incomplete frame header")
     (n,) = struct.unpack("!I", buffer[:4])

@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 import oqs
 
+
 # ---------------------------------------------------------------------
 # COMPATIBILITY LAYER (VERY IMPORTANT)
 # ---------------------------------------------------------------------
@@ -61,13 +62,16 @@ def _get_signature_class():
     # If neither exists, we cannot proceed
     raise RuntimeError("No compatible oqs Signature class found")
 
+
 # Store the correct class once so we don't check repeatedly
 SignatureClass = _get_signature_class()
+
 
 # ---------------------------------------------------------------------
 # DEFAULT ALGORITHM
 # ---------------------------------------------------------------------
 DEFAULT_SIG_ALG = "ML-DSA-65"
+
 
 # ---------------------------------------------------------------------
 # KEYPAIR STRUCTURE
@@ -76,8 +80,10 @@ DEFAULT_SIG_ALG = "ML-DSA-65"
 class SignatureKeypair:
     """
     Simple container for keys.
+
     public_key:
         Share this with the receiver
+
     secret_key:
         Keep this safe on the satellite ONLY
     """
@@ -123,6 +129,7 @@ def sign(message: bytes, secret_key: bytes, algorithm: str = DEFAULT_SIG_ALG) ->
     with SignatureClass(algorithm, secret_key) as signer:
         return signer.sign(message)
 
+
 # ---------------------------------------------------------------------
 # VERIFICATION
 # ---------------------------------------------------------------------
@@ -151,6 +158,7 @@ def verify(
         print(f"[CRYPTO] verify error: {e}")
         return False
 
+
 # ---------------------------------------------------------------------
 # BASE64 HELPERS
 # ---------------------------------------------------------------------
@@ -159,6 +167,7 @@ def b64e(data: bytes) -> str:
     Convert raw bytes → safe string for JSON transport.
     """
     return base64.b64encode(data).decode("ascii")
+
 
 def b64d(data: str) -> bytes:
     """
