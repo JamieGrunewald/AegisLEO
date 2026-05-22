@@ -50,7 +50,7 @@ All post-quantum primitives are provided by [liboqs](https://github.com/open-qua
 
 ## Anomaly Detection
 
-A PyTorch autoencoder is trained on nominal telemetry to establish a baseline reconstruction error profile. At runtime, each decrypted telemetry frame is scored against the model. Frames that pass signature verification but exhibit reconstruction error above threshold are flagged as behavioral anomalies.
+A PyTorch sequence autoencoder is trained on nominal telemetry to establish a baseline reconstruction error profile. At runtime, each decrypted telemetry frame is scored against the model. Frames that pass signature verification but exhibit reconstruction error above threshold are flagged as behavioral anomalies.
 
 The composite **ThreatScore** weights three signals:
 
@@ -67,17 +67,35 @@ The composite **ThreatScore** weights three signals:
 ```
 AegisLEO/
 ├── satellite/          # Transmitter — runs on Raspberry Pi 5
-├── groundstation/      # Receiver + anomaly pipeline — runs on Jetson Orin
-├── adversary/          # Attack tools: replay, fuzzer, MITM proxy, sniffer
-├── crypto/             # ML-KEM, ML-DSA, AES-GCM, HKDF key manager
+│   ├── transmitter.py          # Active: LoRa + PQC + chunked framing (v0.13.0)
+│   └── transmitter_legacy.py  # Historical: early LoRa version (reference only)
+├── groundstation/      # Receiver + detection pipeline — runs on Jetson Orin
+│   ├── receiver.py             # Active: full secure receive loop
+│   ├── reassembly.py           # Chunk reassembly (ReassemblyFactory)
+│   ├── replay_window.py        # Sliding replay protection window
+│   └── feature_logger.py      # ML training data collection (CSV)
+├── adversary/          # Attack tools for detection pipeline testing
+│   ├── kali-inj-bridge.py     # Demo injection: spike / drift / flatline profiles
+│   ├── replay_attack.py        # Packet replay
+│   ├── packet_fuzzer.py        # Malformed frame injection
+│   └── mitm_proxy.py           # MITM proxy
+├── crypto/             # Post-quantum cryptographic primitives
+│   ├── pq_kem.py               # ML-KEM-1024 (FIPS 203)
+│   ├── mldsa_signatures.py     # ML-DSA-65 (FIPS 204)
+│   ├── aes_gcm.py              # AES-256-GCM
+│   └── key_manager.py          # Session key establishment + HKDF
 ├── ccsds/              # CCSDS Space Packet Protocol framing
-├── common/             # Shared telemetry, protocol, logging utilities
-├── models/             # PyTorch autoencoder: training pipeline + runtime detector
-├── radio/              # LoRa serial driver and radio config
-├── experiments/        # Benchmarking: PQC latency, LoRa throughput, packet sizing
+├── common/             # Shared: telemetry model, chunking, protocol, logging
+├── models/             # Anomaly detection
+│   ├── generate_normal_dataset.py  # Synthetic training data generator
+│   ├── window_dataset.py           # Sliding window dataset builder
+│   ├── train_seq_autoencoder.py    # Autoencoder training script
+│   └── runtime_detector.py         # Live inference interface
+├── radio/              # LoRa radio abstraction (v2.0 stub)
+├── experiments/        # PQC benchmarks, LoRa throughput, packet sizing
 ├── tools/              # Key generation, session bootstrap, inspection utilities
 ├── tests/              # pytest suite
-├── config/             # YAML config stubs (crypto, radio, telemetry)
+├── config/             # Runtime configuration (crypto, radio, telemetry)
 └── docs/               # Architecture, PQC design, protocol spec
 ```
 
@@ -106,21 +124,17 @@ pip install -r requirements.txt
 
 ### Generate keys
 
+**Step 1 — ML-DSA-65 signing keypair (satellite node):**
 ```bash
 python tools/generate_keys.py
 ```
+Produces `keys/satellite_mldsa_secret.key` (Pi only) and `keys/satellite_mldsa_public.key` (copy to Jetson).
 
-This produces:
-- `keys/satellite_mldsa_public.key` — distribute to ground station
-- `keys/satellite_mldsa_secret.key` — stays on the satellite node only
-- `dev_secrets/groundstation/receiver_kem_private.key` — stays on ground station
-- `dev_secrets/satellite/receiver_kem_public.key` — distribute to satellite node
-
-### Bootstrap a receiver session
-
+**Step 2 — ML-KEM-1024 KEM keypair (ground station):**
 ```bash
 python tools/bootstrap_receiver_session.py
 ```
+Produces `dev_secrets/groundstation/receiver_kem_private.key` (Jetson only) and `dev_secrets/satellite/receiver_kem_public.key` (copy to Pi).
 
 ### Run
 
@@ -134,11 +148,24 @@ python -m satellite.transmitter
 python -m groundstation.receiver
 ```
 
-**Adversary node (optional):**
+**Adversary node (Kali VM):**
 ```bash
+python adversary/kali-inj-bridge.py --profile spike
 python adversary/replay_attack.py
 python adversary/packet_fuzzer.py
 ```
+
+### Train the anomaly detector
+
+```bash
+# Generate nominal telemetry dataset
+python -m models.generate_normal_dataset
+
+# Train the sequence autoencoder
+python -m models.train_seq_autoencoder
+```
+
+Trained model saved to `models/seq_autoencoder.pt`. Update `config/telemetry.yaml` with the output threshold.
 
 ### Run tests
 
@@ -150,11 +177,28 @@ pytest tests/ -v
 
 ## Roadmap (v2.0)
 
-- [ ] Replace LoRa modules with HackRF One (TX) + RTL-SDR v4 (RX) for over-the-air RF testing
+**In progress (stubs in repo):**
+- [ ] `radio/lora_serial.py` — LoRa serial abstraction layer for HackRF/RTL-SDR migration
+- [ ] `groundstation/reassembly.py` → `ReassemblyFactory` extraction and standalone testing
+- [ ] `models/telemetry_anomaly_model.py` — unified model interface replacing rule-based detector
+- [ ] `models/training_pipeline.py` — end-to-end training orchestration script
+
+**Planned:**
+- [ ] Replace SX1262 LoRa with HackRF One (TX) + RTL-SDR v4 (RX) for over-the-air RF testing
 - [ ] GNU Radio integration for Doppler shift and AWGN channel modeling
 - [ ] InfluxDB + Grafana observability stack for real-time ThreatScore dashboards
 - [ ] Hailo-10H accelerator for on-board LLM-assisted anomaly explanation
 - [ ] IEEE Aerospace 2027 paper submission
+
+---
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | System diagram, node roles, data flow, transport framing |
+| [docs/pqc_design.md](docs/pqc_design.md) | Algorithm selection, key lifecycle, threat model |
+| [docs/protocol_spec.md](docs/protocol_spec.md) | Packet types, session state machine, CCSDS alignment |
 
 ---
 
