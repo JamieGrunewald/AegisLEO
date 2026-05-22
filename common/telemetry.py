@@ -28,12 +28,10 @@ v0.1.0  Initial dataclass with JSON serialization.
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass, asdict
 import json
 import time
 from typing import Any, Dict, List
-
 
 # ---------------------------------------------------------------------
 # Mode encoding (stable + extensible)
@@ -44,9 +42,7 @@ MODE_MAP = {
     "SUNPOINT": 1,
     "TX_WINDOW": 2,
 }
-
 MODE_COUNT = len(MODE_MAP)
-
 
 # ---------------------------------------------------------------------
 # Telemetry dataclass
@@ -235,11 +231,11 @@ class Telemetry:
 def sample_telemetry(seq: int) -> Telemetry:
     """
     Generate a synthetic nominal telemetry sample for a given sequence number.
-
     Values cycle through small deterministic variations to simulate a live
     downlink. Used for training data generation and lab testing without
     physical hardware.
     """
+        
     return Telemetry(
         seq=seq,
         timestamp=time.time(),
