@@ -1,4 +1,13 @@
 """
+[LEGACY — DO NOT USE IN PRODUCTION]
+
+This is an earlier, pre-hardened version of the ground station receiver retained
+for historical reference only. It lacks the transport-hardened framing, selective
+session_init recovery, replay protection, and standardized demo logging present
+in receiver.py.
+
+Use groundstation/receiver.py for all active work.
+
 AegisLEO Secure Ground Station Receiver
 
 Created by: Jamie Grunewald

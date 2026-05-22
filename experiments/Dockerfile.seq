@@ -1,0 +1,38 @@
+FROM nvcr.io/nvidia/pytorch:25.05-py3-igpu
+
+WORKDIR /workspace
+
+COPY . /workspace
+
+RUN apt-get update && apt-get install -y \
+    cmake \
+    ninja-build \
+    build-essential \
+    git \
+    python3-dev \
+    moreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir -r requirements.runtime.txt
+
+RUN cd /workspace/liboqs && \
+    mkdir -p build && \
+    cd build && \
+    cmake -GNinja \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON \
+        -DOQS_BUILD_ONLY_LIB=ON \
+        .. && \
+    ninja && \
+    ninja install && \
+    ldconfig && \
+    find /usr/local -name "liboqs.so*" && \
+    ldconfig -p | grep oqs
+
+ENV OQS_INSTALL_PATH=/usr/local
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH}
+
+RUN git clone --depth=1 https://github.com/open-quantum-safe/liboqs-python.git /tmp/liboqs-python && \
+    pip install --no-cache-dir /tmp/liboqs-python
+
+CMD ["bash"]

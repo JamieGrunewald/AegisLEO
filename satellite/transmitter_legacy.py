@@ -1,4 +1,12 @@
 """
+[LEGACY — DO NOT USE IN PRODUCTION]
+
+This is an earlier, pre-hardened version of the satellite transmitter retained
+for historical reference only. It lacks the transport-hardened framing, selective
+session_init recovery, and standardized demo logging present in transmitter.py.
+
+Use satellite/transmitter.py for all active work.
+
 AegisLEO Secure Satellite Telemetry Transmitter
 
 Created by: Jamie Grunewald

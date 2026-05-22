@@ -49,4 +49,8 @@ Thumbs.db
 # ------------------------
 # Third Party
 # ------------------------
-third_party/liboqs-python/.git
+third_party/
+# ------------------------
+# Data directories (generated at runtime)
+# ------------------------
+data/

@@ -1,30 +1,56 @@
 """
 AegisLEO Ground Station Secure Receiver
-Transport-Hardened RF Version with Selective Recovery for session_init
+Transport-Hardened RF Version with ReassemblyFactory + Byte-Stuffed Framing
 
 Created by: Jamie Grunewald
-Date: 2026-03-26
+Date: 2026-03-25
 Version: v0.13.0
 
-What changed in v0.13.0
+What this script does
+---------------------
+This script runs on the ground station and listens for secure telemetry
+coming from the satellite node over the LoRa serial link.
+
+High-level flow
+---------------
+1. Read framed transport packets from serial
+2. Validate packet structure
+3. Validate chunk CRC so corrupted chunks do not poison reassembly
+4. Reassemble chunks into one full logical packet
+5. Decode + verify signature + establish/decrypt session data
+6. Apply replay protection
+7. Run ML anomaly detection
+8. Send ACK/NACK back to the satellite side
+
+Framing in this version
 -----------------------
-1. Standardized demo logging with banner / kv / dlog helpers
-2. Removed stray embedded docstring inside telemetry processing path
-3. Added human-readable Telemetry object for stage output
-4. Preserved ciphertext-before-plaintext proof view
-5. Kept transport framing / reassembly / ACK/NACK behavior stable
-6. Added clearer comments for learning and presentation use
+Wire format (both directions):
+    FRAME_START + STUFFED_LEN(4+) + PAYLOAD + FRAME_END
+
+The 4-byte big-endian length field is byte-stuffed so that 0x7E, 0x7F,
+and 0x7D never appear raw inside it. This prevents the parser from
+misreading a length byte as a frame boundary on a noisy RF link.
+
+Reassembly in this version
+---------------------------
+ChunkAssembly and buffer management have been extracted into
+ReassemblyFactory (groundstation/reassembly.py). receiver.py now calls
+factory.add_chunk() per incoming chunk and factory.flush_stale() on
+idle cycles to send NACKs for expired incomplete messages.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import time
-import zlib
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from common.demo_log import (
+    dlog,
+    banner,
+    kv,
+)
+from common.telemetry import Telemetry
 
 import serial
 
@@ -34,16 +60,13 @@ from crypto.key_manager import KeyManager
 from crypto.mldsa_signatures import verify, b64d
 from groundstation.replay_window import ReplayWindow
 from models.runtime_detector import RuntimeDetector
+from groundstation.feature_logger import FeatureLogger
 
-from common.demo_log import (
-    banner,
-    dlog,
-    kv,
-    section,
-    crypto_verdict,
-    ml_verdict,
-)
-from common.telemetry import Telemetry
+from groundstation.reassembly import ReassemblyFactory, decode_assembled_payload
+factory = ReassemblyFactory()
+
+detector = RuntimeDetector()
+feature_logger = FeatureLogger("groundstation/logs/telemetry_normal.csv")
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -66,13 +89,19 @@ FRAME_START = b"\x7E"
 FRAME_END = b"\x7F"
 FRAME_LEN_BYTES = 4
 
+# Byte-stuffing constants.
+# The 4-byte length field is escaped so 0x7E/0x7F/0x7D never appear
+# raw inside it, preventing false frame-boundary detection on RF links.
+FRAME_ESC     = 0x7D   # escape byte
+FRAME_ESC_XOR = 0x20   # XOR mask: 0x7E->0x5E, 0x7F->0x5F, 0x7D->0x5D
+
 # Maximum JSON payload size inside one transport frame.
 MAX_FRAME_JSON_BYTES = 4096
 
-TELEMETRY_TTL_SECONDS = 8.0
-SESSION_INIT_TTL_SECONDS = 25
+TELEMETRY_TTL_SECONDS = 30.0
+SESSION_INIT_TTL_SECONDS = 120
 
-MAX_MISSING_PER_NACK = 24
+MAX_MISSING_PER_NACK = 36   
 
 DEBUG_SHOW_CIPHERTEXT = True
 CIPHERTEXT_PREVIEW_LEN = 96
@@ -102,6 +131,8 @@ STATS = {
 
 STATS_LAST_PRINT = time.time()
 STATS_PRINT_INTERVAL = 5.0
+NACK_LAST_SENT = time.time()
+NACK_SEND_INTERVAL = 30.0
 
 # ---------------------------------------------------------------------
 # Load key material
@@ -111,66 +142,6 @@ with open(SATELLITE_MLDSA_PUBLIC_KEY_PATH, "rb") as f:
 
 with open(RECEIVER_KEM_PRIVATE_KEY_PATH, "rb") as f:
     RECEIVER_KEM_PRIVATE_KEY = f.read()
-
-# ---------------------------------------------------------------------
-# Reassembly helper class
-# ---------------------------------------------------------------------
-
-
-@dataclass
-class ChunkAssembly:
-    """
-    Hold pieces of one logical packet while chunks arrive.
-    """
-
-    total_chunks: int
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-    parts: dict[int, str] = field(default_factory=dict)
-
-    def add_part(self, idx: int, data: str) -> tuple[bool, bool]:
-        """
-        Returns
-        -------
-        (accepted_duplicate, conflicting_duplicate)
-        """
-        existing = self.parts.get(idx)
-
-        if existing is not None:
-            if existing == data:
-                self.updated_at = time.time()
-                return True, False
-            return False, True
-
-        self.parts[idx] = data
-        self.updated_at = time.time()
-        return False, False
-
-    def is_complete(self) -> bool:
-        return len(self.parts) == self.total_chunks
-
-    def missing_indexes(self) -> list[int]:
-        return [i for i in range(self.total_chunks) if i not in self.parts]
-
-    def assemble(self) -> str:
-        return "".join(self.parts[i] for i in range(self.total_chunks))
-
-
-# ---------------------------------------------------------------------
-# Decode the finished logical packet
-# ---------------------------------------------------------------------
-
-
-def b64text_to_packet(text: str) -> dict[str, Any]:
-    """
-    Reverse the sender-side logical packet pipeline:
-    1. base64 decode
-    2. zlib decompress
-    3. JSON decode
-    """
-    compressed = base64.b64decode(text.encode("utf-8"), validate=True)
-    raw = zlib.decompress(compressed)
-    return json.loads(raw.decode("utf-8"))
 
 
 # ---------------------------------------------------------------------
@@ -183,9 +154,9 @@ detector = RuntimeDetector()
 
 sessions: dict[str, object] = {}
 replay_windows: dict[str, ReplayWindow] = {}
-reassembly_buffers: dict[tuple[str, str, int | None], ChunkAssembly] = {}
 
-# Raw serial byte buffer. Incomplete data stays here until a full frame exists.
+
+# Raw serial byte buffer. We keep incomplete data here until a full frame exists.
 serial_buffer = bytearray()
 
 banner("AegisLEO Ground Station Secure Receiver")
@@ -194,13 +165,12 @@ kv("Baud rate", BAUD_RATE)
 kv("KEM alg", key_manager.algorithm)
 print("Press Ctrl+C to stop.", flush=True)
 
-
 # ---------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------
 
 
-def pretty_time(epoch: int | float) -> str:
+def pretty_time(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
@@ -213,22 +183,95 @@ def print_stats() -> None:
 
     STATS_LAST_PRINT = now
 
-    dlog(
-        "GROUND",
-        "STATS",
-        "Transport counters",
-        frames=STATS["frames_total"],
-        utf8_fail=STATS["frames_utf8_fail"],
-        json_fail=STATS["frames_json_fail"],
-        bad_len=STATS["frames_bad_length"],
-        bad_end=STATS["frames_bad_end_marker"],
-        chunks=STATS["chunks_total"],
-        ok=STATS["chunks_accepted"],
-        dup=STATS["chunks_duplicate"],
-        crc_fail=STATS["chunks_crc_fail"],
-        conflict=STATS["chunks_conflict"],
-        reassembled=STATS["reassembly_complete"],
+    print(
+        "[GROUND][STATS] "
+        f"frames={STATS['frames_total']} "
+        f"utf8_fail={STATS['frames_utf8_fail']} "
+        f"json_fail={STATS['frames_json_fail']} "
+        f"bad_len={STATS['frames_bad_length']} "
+        f"bad_end={STATS['frames_bad_end_marker']} | "
+        f"chunks={STATS['chunks_total']} "
+        f"ok={STATS['chunks_accepted']} "
+        f"dup={STATS['chunks_duplicate']} "
+        f"crc_fail={STATS['chunks_crc_fail']} "
+        f"conflict={STATS['chunks_conflict']} | "
+        f"reassembled={STATS['reassembly_complete']}"
     )
+
+
+def _stuff_length(length_bytes: bytes) -> bytes:
+    """
+    Byte-stuff a 4-byte length field before writing to the wire.
+
+    Why we need this
+    ----------------
+    Our frame delimiters are 0x7E (FRAME_START) and 0x7F (FRAME_END).
+    If either of those values appears raw inside the 4-byte length field,
+    the parser on the other side will misread it as a frame boundary and
+    lose alignment. We escape them so the length field is always safe.
+
+    Encoding table:
+        0x7E  ->  0x7D 0x5E   (start marker escaped)
+        0x7F  ->  0x7D 0x5F   (end marker escaped)
+        0x7D  ->  0x7D 0x5D   (escape byte itself escaped)
+    """
+    out = bytearray()
+    for b in length_bytes:
+        if b in (0x7E, 0x7F, 0x7D):
+            out.append(FRAME_ESC)
+            out.append(b ^ FRAME_ESC_XOR)
+        else:
+            out.append(b)
+    return bytes(out)
+
+
+def _unstuff_length(buf: bytearray, start: int) -> tuple[int | None, int]:
+    """
+    Read and unstuff a 4-byte length field from the receive buffer.
+
+    Parameters
+    ----------
+    buf   : the raw serial receive buffer (bytearray)
+    start : index in buf where the (possibly stuffed) length field begins
+            (immediately after the FRAME_START byte)
+
+    Returns
+    -------
+    (length_value, bytes_consumed)
+        length_value  = the decoded integer length, or None if buf is
+                        too short to read the full length field yet
+        bytes_consumed = how many raw bytes from buf the length field used
+                         (4 minimum, up to 8 in the worst case where all
+                          four bytes needed escaping)
+
+    How it works
+    ------------
+    We read bytes one at a time. If we see the escape byte (0x7D) we
+    consume the NEXT byte too and XOR it with 0x20 to recover the
+    original value. We keep going until we have decoded 4 bytes of
+    actual length data.
+    """
+    out = bytearray()   # decoded length bytes accumulated here
+    i = start           # current position in buf
+
+    while len(out) < 4:
+        if i >= len(buf):
+            return None, 0      # not enough bytes yet — wait for more
+
+        b = buf[i]
+
+        if b == FRAME_ESC:
+            # Escape sequence: the NEXT byte is the real value XOR 0x20
+            if i + 1 >= len(buf):
+                return None, 0  # escape byte arrived but follower hasn't yet
+            out.append(buf[i + 1] ^ FRAME_ESC_XOR)
+            i += 2              # consumed 2 raw bytes for 1 decoded byte
+        else:
+            out.append(b)
+            i += 1              # consumed 1 raw byte for 1 decoded byte
+
+    # i - start = total raw bytes consumed by the length field
+    return int.from_bytes(out, "big"), i - start
 
 
 def write_framed_packet(pkt: dict[str, Any]) -> None:
@@ -240,11 +283,15 @@ def write_framed_packet(pkt: dict[str, Any]) -> None:
         [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
     """
     payload = json.dumps(pkt, separators=(",", ":")).encode("utf-8")
-    length = len(payload).to_bytes(4, "big")
+    # Byte-stuff the length so 0x7E/0x7F/0x7D never appear raw in it.
+    length = _stuff_length(len(payload).to_bytes(4, "big"))
     wire = FRAME_START + length + payload + FRAME_END
     ser.write(wire)
     ser.flush()
-    time.sleep(0.05)
+    # Wait for LoRa half-duplex TX->RX turnaround before sending.
+    # Without this, the NACK arrives while the Pi module is still
+    # switching modes, causing frame corruption on the receive side.
+    time.sleep(1.5)
 
 
 def send_ack(session_id: str, message_id: int | None) -> None:
@@ -255,7 +302,7 @@ def send_ack(session_id: str, message_id: int | None) -> None:
     write_framed_packet(pkt)
 
     if DEBUG_ACKS:
-        dlog("GROUND", "ACK", "Sent ACK to satellite", sid=session_id, mid=message_id)
+        print(f"[GROUND][ACK] sid={session_id} mid={message_id}")
 
 
 def send_nack(session_id: str, missing: list[int], message_id: int | None = None) -> None:
@@ -273,73 +320,81 @@ def send_nack(session_id: str, missing: list[int], message_id: int | None = None
     write_framed_packet(pkt)
 
     if DEBUG_ACKS:
-        dlog(
-            "GROUND",
-            "NACK",
-            "Sent NACK to satellite",
-            sid=session_id,
-            mid=message_id,
-            missing=compact_missing,
-        )
+        print(f"[GROUND][NACK] sid={session_id} mid={message_id} missing={compact_missing}")
 
 
 def get_reassembly_ttl(message_id: int | None) -> float:
     return SESSION_INIT_TTL_SECONDS if message_id is None else TELEMETRY_TTL_SECONDS
 
+def add_transport_chunk(packet: dict[str, Any]) -> tuple[str, int | None, str] | None:
+    """
+    Hand one incoming transport chunk to ReassemblyFactory.
 
-def cleanup_reassembly_buffers() -> None:
-    now = time.time()
-    stale_keys: list[tuple[str, str, int | None]] = []
+    Returns (session_id, message_id, assembled_b64) when ALL chunks for
+    this message have arrived and the full payload is ready to decode.
+    Returns None while we are still waiting for more chunks.
 
-    for key, buf in reassembly_buffers.items():
-        _, _, message_id = key
-        ttl = get_reassembly_ttl(message_id)
-        age = now - buf.updated_at
+    Why this wrapper exists
+    -----------------------
+    The main loop calls this by name for every incoming chunk packet.
+    All factory interaction and stats sync lives here in one place,
+    keeping the main loop readable.
+    """
+    chunk_type    = packet["t"]
+    session_id    = packet["sid"]
+    message_id    = packet.get("mid")
+    chunk_index   = int(packet["i"])
+    chunk_total   = int(packet["n"])
+    data_fragment = packet["d"]
+    crc_expected  = int(packet["c"])
 
-        if age > ttl and not buf.is_complete():
-            stale_keys.append(key)
+    # Hand the chunk to the factory.
+    # It handles: CRC check, duplicate detection, conflict detection,
+    # TTL cleanup, buffer management, and reassembly completion.
+    is_complete, missing = factory.add_chunk(
+        chunk_type=chunk_type,
+        session_id=session_id,
+        message_id=message_id,
+        chunk_index=chunk_index,
+        chunk_total=chunk_total,
+        data_fragment=data_fragment,
+        crc_expected=crc_expected,
+    )
 
-    for key in stale_keys:
-        _, session_id, message_id = key
-        buf = reassembly_buffers[key]
-        missing = buf.missing_indexes()
+    # Sync factory stats into the local STATS dict so print_stats() works.
+    state = factory.debug_state()
+    STATS["chunks_total"]      = state["chunks_total"]
+    STATS["chunks_accepted"]   = state["chunks_accepted"]
+    STATS["chunks_duplicate"]  = state["chunks_duplicate"]
+    STATS["chunks_conflict"]   = state["chunks_conflict"]
+    STATS["chunks_crc_fail"]   = state["chunks_crc_fail"]
+    STATS["reassembly_complete"] = state["reassembled"]
 
-        label = "session_init" if message_id is None else "telemetry"
-        dlog(
-            "GROUND",
-            "RECOVERY",
-            "Stale partial assembly detected",
-            kind=label,
-            sid=session_id,
-            mid=message_id,
-            have=f"{len(buf.parts)}/{buf.total_chunks}",
-            missing_count=len(missing),
+    if DEBUG_CHUNKS:
+        suffix = "" if not missing else f" missing={len(missing)}"
+        print(
+            f"[GROUND][CHUNK] t={chunk_type} sid={session_id} "
+            f"mid={message_id} idx={chunk_index}/{chunk_total - 1}{suffix}"
         )
 
-        if len(missing) <= 10:
-            dlog(
-                "GROUND",
-                "RECOVERY_DETAIL",
-                "Missing indexes still required",
-                sid=session_id,
-                mid=message_id,
-                missing=missing,
-            )
+    if not is_complete:
+        return None
 
-        send_nack(session_id=session_id, message_id=message_id, missing=missing)
+    # Message is complete. Retrieve the assembled payload and clean up.
+    assembled_b64 = factory.get_assembled(chunk_type, session_id, message_id)
+    if assembled_b64 is None:
+        return None  # Defensive guard, should not happen in normal flow.
 
-        # Keep any chunks we already have, but refresh the assembly timer.
-        new_buf = ChunkAssembly(total_chunks=buf.total_chunks)
-        new_buf.parts = dict(buf.parts)
-        new_buf.updated_at = time.time()
-        reassembly_buffers[key] = new_buf
+    if DEBUG_REASSEMBLY:
+        print(
+            f"[GROUND][REASSEMBLED] t={chunk_type} sid={session_id} "
+            f"mid={message_id} len={len(assembled_b64)}"
+        )
+
+    return session_id, message_id, assembled_b64
 
 
 def validate_transport_packet(packet: dict[str, Any]) -> bool:
-    """
-    Validate the outer transport packet before it enters the chunk
-    reassembly pipeline.
-    """
     packet_type = packet.get("t")
 
     if packet_type in {"ack", "nack"}:
@@ -348,12 +403,12 @@ def validate_transport_packet(packet: dict[str, Any]) -> bool:
     required = {"t", "sid", "i", "n", "d", "c"}
     if not required.issubset(packet):
         if DEBUG_SCHEMA:
-            dlog("GROUND", "SCHEMA", "Missing keys in transport packet", packet=packet)
+            print(f"[GROUND][SCHEMA] missing keys in transport packet: {packet}")
         return False
 
     if packet_type not in {"si", "tc"}:
         if DEBUG_SCHEMA:
-            dlog("GROUND", "SCHEMA", "Invalid transport packet type", t=packet_type)
+            print(f"[GROUND][SCHEMA] invalid transport type: {packet_type}")
         return False
 
     if not isinstance(packet["sid"], str) or not packet["sid"]:
@@ -383,131 +438,28 @@ def validate_transport_packet(packet: dict[str, Any]) -> bool:
 
     return True
 
-
-def add_transport_chunk(packet: dict[str, Any]) -> tuple[str, int | None, str] | None:
-    """
-    Add one validated transport chunk to the proper reassembly buffer.
-    """
-    cleanup_reassembly_buffers()
-
-    chunk_type = packet["t"]
-    session_id = packet["sid"]
-    message_id = packet.get("mid")
-    chunk_index = int(packet["i"])
-    chunk_total = int(packet["n"])
-    data_fragment = packet["d"]
-
-    STATS["chunks_total"] += 1
-
-    expected_crc = int(packet["c"])
-    actual_crc = zlib.crc32(data_fragment.encode("utf-8")) & 0xFFFFFFFF
-
-    if actual_crc != expected_crc:
-        STATS["chunks_crc_fail"] += 1
-        dlog(
-            "GROUND",
-            "CRC_FAIL",
-            "Chunk CRC mismatch",
-            sid=session_id,
-            mid=message_id,
-            idx=chunk_index,
-            expected=f"{expected_crc:#010x}",
-            actual=f"{actual_crc:#010x}",
-        )
-        return None
-
-    key = (chunk_type, session_id, message_id)
-
-    if key not in reassembly_buffers:
-        reassembly_buffers[key] = ChunkAssembly(total_chunks=chunk_total)
-
-    buf = reassembly_buffers[key]
-
-    if buf.total_chunks != chunk_total:
-        if DEBUG_SCHEMA:
-            dlog(
-                "GROUND",
-                "SCHEMA",
-                "Chunk total mismatch, resetting assembly",
-                sid=session_id,
-                mid=message_id,
-                old_total=buf.total_chunks,
-                new_total=chunk_total,
-            )
-        del reassembly_buffers[key]
-        return None
-
-    accepted_duplicate, conflicting_duplicate = buf.add_part(chunk_index, data_fragment)
-
-    if accepted_duplicate:
-        STATS["chunks_duplicate"] += 1
-
-    if conflicting_duplicate:
-        STATS["chunks_conflict"] += 1
-        dlog(
-            "GROUND",
-            "WARN",
-            "Conflicting duplicate chunk detected, resetting assembly",
-            sid=session_id,
-            mid=message_id,
-            idx=chunk_index,
-        )
-        del reassembly_buffers[key]
-        return None
-
-    if not accepted_duplicate:
-        STATS["chunks_accepted"] += 1
-
-    if DEBUG_CHUNKS:
-        dlog(
-            "GROUND",
-            "CHUNK_RX",
-            "Chunk accepted",
-            t=chunk_type,
-            sid=session_id,
-            mid=message_id,
-            idx=f"{chunk_index}/{chunk_total - 1}",
-            dup=accepted_duplicate,
-        )
-
-    if DEBUG_REASSEMBLY:
-        dlog(
-            "GROUND",
-            "REASSEMBLY",
-            "Chunk progress",
-            sid=session_id,
-            mid=message_id,
-            have=f"{len(buf.parts)}/{buf.total_chunks}",
-        )
-
-    if not buf.is_complete():
-        return None
-
-    assembled_b64 = buf.assemble()
-    del reassembly_buffers[key]
-
-    STATS["reassembly_complete"] += 1
-
-    if DEBUG_REASSEMBLY:
-        dlog(
-            "GROUND",
-            "REASSEMBLED",
-            "Logical packet fully reassembled",
-            t=chunk_type,
-            sid=session_id,
-            mid=message_id,
-            length=len(assembled_b64),
-        )
-
-    return session_id, message_id, assembled_b64
-
-
 def extract_framed_packets(buffer: bytearray) -> list[bytes]:
+    
     """
     Extract complete length-prefixed frames from the raw serial buffer.
 
-    Frame format:
-        [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
+    Frame format
+    ------------
+    [FRAME_START][LEN:4][PAYLOAD][FRAME_END]
+
+    Why this parser exists
+    ----------------------
+    LoRa/serial links can split, merge, or corrupt bytes. We therefore:
+    - discard garbage before FRAME_START
+    - require the 4-byte payload length field
+    - wait until the full frame is present
+    - verify FRAME_END before accepting the payload
+    - drop 1 byte and resync if framing looks wrong
+
+    Important design rule
+    ---------------------
+    We trust the payload length more than blind delimiter searching.
+    That gives us more stable recovery on noisy links.
     """
     frames: list[bytes] = []
 
@@ -521,6 +473,8 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
         if start > 0:
             del buffer[:start]
 
+        # Need at least:
+        # 1 byte FRAME_START + 4 byte length field
         if len(buffer) < 1 + FRAME_LEN_BYTES:
             break
 
@@ -528,38 +482,47 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
             del buffer[0]
             continue
 
-        payload_len = int.from_bytes(buffer[1:5], "big")
+        # Unstuff the length field. It starts at index 1 (after FRAME_START).
+        # _unstuff_length returns (None, 0) if the buffer doesn't yet have
+        # enough bytes to decode a full length field — we wait for more.
+        payload_len, len_consumed = _unstuff_length(buffer, 1)
+
+        if payload_len is None:
+            break   # incomplete length field, wait for more serial data
 
         if payload_len <= 0 or payload_len > MAX_FRAME_JSON_BYTES:
-            STATS["frames_bad_length"] += 1
             if DEBUG_BAD_FRAMES:
-                dlog(
-                    "GROUND",
-                    "WARN",
-                    "Invalid frame length, dropping 1 byte to resync",
-                    payload_len=payload_len,
-                )
+                print(f"[GROUND] WARN: invalid frame length {payload_len}, dropping 1 byte to resync")
+            STATS["frames_bad_length"] += 1
             del buffer[0]
             continue
 
-        total_len = 1 + 4 + payload_len + 1
+        # Total frame size accounts for variable-width stuffed length field:
+        #   1 (FRAME_START) + len_consumed (stuffed length) + payload_len + 1 (FRAME_END)
+        total_len = 1 + len_consumed + payload_len + 1
 
         if len(buffer) < total_len:
+            # Incomplete frame — wait for more bytes.
             break
 
-        payload = bytes(buffer[5:5 + payload_len])
-        end_marker = buffer[5 + payload_len:5 + payload_len + 1]
+        payload_start = 1 + len_consumed
+        payload = bytes(buffer[payload_start:payload_start + payload_len])
+        end_marker = buffer[total_len - 1:total_len]
 
         if end_marker != FRAME_END:
+            # Count framing failures so the stats line reflects reality.
             STATS["frames_bad_end_marker"] += 1
+
+            # Only print every 10th framing warning to keep logs readable.
+            # We still count every failure in STATS.
             if DEBUG_BAD_FRAMES and STATS["frames_bad_end_marker"] % 10 == 0:
-                dlog(
-                    "GROUND",
-                    "WARN",
-                    "Bad frame end marker, dropping 1 byte to resync",
-                    end_marker=repr(end_marker),
-                    count=STATS["frames_bad_end_marker"],
+                print(
+                    f"[GROUND] WARN: bad frame end marker {end_marker!r}, "
+                    f"count={STATS['frames_bad_end_marker']} "
+                    "dropping 1 byte to resync"
                 )
+
+            # Drop one byte and search for the next valid frame start.
             del buffer[0]
             continue
 
@@ -568,18 +531,38 @@ def extract_framed_packets(buffer: bytearray) -> list[bytes]:
 
     return frames
 
-
 # ---------------------------------------------------------------------
 # Main receive loop
 # ---------------------------------------------------------------------
 while True:
     try:
+        # Bigger read helps reduce application-layer fragmentation.
         incoming = ser.read(2048)
 
         if incoming:
             serial_buffer.extend(incoming)
         else:
-            cleanup_reassembly_buffers()
+            # No data arrived this read cycle.
+            # Ask the factory to evict any stale incomplete messages
+            # and send a NACK for each one so the satellite knows to retry.
+            # Periodically send NACKs for incomplete sessions without expiring buffers
+            now = time.time()
+            if now - NACK_LAST_SENT >= NACK_SEND_INTERVAL:
+                NACK_LAST_SENT = now
+                for key, buf in list(factory._buffers.items()):
+                    if not buf.is_complete():
+                        _, session_id_k, message_id_k = key
+                        missing_k = buf.missing_indexes()
+                        if missing_k:
+                            label = "session_init" if message_id_k is None else "telemetry"
+                            if DEBUG_ACKS:
+                                print(f"[GROUND][INFO] periodic nack {label} sid={session_id_k} mid={message_id_k} missing_count={len(missing_k)}")
+                            send_nack(session_id=session_id_k, message_id=message_id_k, missing=missing_k)
+            for sid, mid, missing in factory.flush_stale():
+                label = "session_init" if mid is None else "telemetry"
+                if DEBUG_ACKS:
+                    print(f"[GROUND][INFO] stale {label} sid={sid} mid={mid} missing_count={len(missing)}")
+                send_nack(session_id=sid, message_id=mid, missing=missing)
             print_stats()
             continue
 
@@ -589,11 +572,13 @@ while True:
             STATS["frames_total"] += 1
 
             try:
-                # Transport packets should be JSON objects, so raw payload
-                # should begin with "{".
+                # Quick sanity check:
+                # all transport packets should be JSON objects, so the raw
+                # payload should begin with "{". If not, the frame is almost
+                # certainly misaligned or corrupted.
                 if not frame_bytes.startswith(b"{"):
                     if DEBUG_BAD_FRAMES:
-                        dlog("GROUND", "WARN", "Non-JSON frame dropped", preview=repr(frame_bytes[:80]))
+                        print(f"[GROUND] WARN: non-JSON frame dropped: {frame_bytes[:80]!r}")
                     STATS["frames_json_fail"] += 1
                     continue
 
@@ -606,22 +591,24 @@ while True:
             except UnicodeDecodeError:
                 STATS["frames_utf8_fail"] += 1
                 if DEBUG_BAD_FRAMES:
-                    dlog("GROUND", "WARN", "Non-UTF8 frame dropped", preview=repr(frame_bytes[:80]))
+                    print(f"[GROUND] WARN: non-UTF8 frame dropped: {frame_bytes[:80]!r}")
                 continue
 
             except json.JSONDecodeError:
                 STATS["frames_json_fail"] += 1
                 if DEBUG_BAD_FRAMES:
-                    dlog("GROUND", "WARN", "Invalid framed JSON dropped", preview=repr(frame_bytes[:80]))
+                    print(f"[GROUND] WARN: invalid framed JSON: {frame_bytes[:80]!r}")
                 continue
 
             if not validate_transport_packet(transport_packet):
                 continue
 
-            # Receiver ignores control packets arriving on RX path.
             if transport_packet.get("t") in {"ack", "nack"}:
                 continue
 
+            # add_transport_chunk hands this chunk to ReassemblyFactory.
+            # Returns None while chunks are still missing.
+            # Returns (session_id, message_id, assembled_b64) when complete.
             reassembled = add_transport_chunk(transport_packet)
             if reassembled is None:
                 continue
@@ -629,15 +616,13 @@ while True:
             session_id, message_id, assembled_b64 = reassembled
 
             try:
-                packet = b64text_to_packet(assembled_b64)
+                # decode_assembled_payload reverses the transmitter pipeline:
+                #   base64 -> zlib decompress -> JSON parse -> Python dict
+                packet = decode_assembled_payload(assembled_b64)
             except Exception as exc:
-                dlog(
-                    "GROUND",
-                    "WARN",
-                    "Logical packet decode failed",
-                    sid=session_id,
-                    mid=message_id,
-                    error=str(exc),
+                print(
+                    f"[GROUND] WARN: logical packet decode failed "
+                    f"sid={session_id} mid={message_id}: {exc}"
                 )
                 send_nack(session_id=session_id, message_id=message_id, missing=list(range(0, 8)))
                 continue
@@ -664,18 +649,18 @@ while True:
                     )
 
                     if not is_valid_signature:
-                        dlog("GROUND", "REJECT", "Session-init signature invalid", sid=session_id)
+                        print("[GROUND] REJECTED: session_init signature invalid")
                         send_nack(session_id=session_id, message_id=message_id, missing=[0])
                         continue
 
                     session_id = packet["session_id"]
 
                     if session_id in sessions:
-                        dlog("GROUND", "SESSION_EXISTS", "Session already exists", sid=session_id)
+                        print(f"[GROUND] INFO: session already exists ({session_id})")
                         send_ack(session_id, message_id)
                         continue
 
-                    dlog("GROUND", "SESSION_INIT_RX", "Received signed session-init", sid=session_id)
+                    dlog("GROUND", "SESSION_INIT_RX", "Received signed session-init", session=session_id)
 
                     session = key_manager.create_receiver_session(
                         kem_ciphertext=b64d(packet["kem_ciphertext"]),
@@ -686,18 +671,12 @@ while True:
                     sessions[session_id] = session
                     replay_windows[session_id] = ReplayWindow(window_size=64)
 
-                    dlog("GROUND", "SESSION_ESTABLISHED", "Receiver session established", sid=session_id)
+                    dlog("GROUND", "SESSION_ESTABLISHED", "Receiver session established", session=session_id)
                     send_ack(session_id, message_id)
                     continue
 
                 except Exception as exc:
-                    dlog(
-                        "GROUND",
-                        "REJECT",
-                        "Session-init processing failed",
-                        sid=session_id,
-                        error=str(exc),
-                    )
+                    print(f"[GROUND] REJECTED: session_init processing failed: {exc}")
                     send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
 
@@ -705,7 +684,7 @@ while True:
             # TELEMETRY
             # =========================================================
             if packet_type != "telemetry":
-                dlog("GROUND", "WARN", "Unknown logical packet type", packet_type=packet_type)
+                print(f"[GROUND] WARN: unknown logical packet type: {packet_type}")
                 send_nack(session_id=session_id, message_id=message_id, missing=[0])
                 continue
 
@@ -726,14 +705,14 @@ while True:
                 )
 
                 if not is_valid_signature:
-                    dlog("GROUND", "REJECT", "Telemetry signature invalid", sid=session_id, mid=message_id)
+                    print("[GROUND] REJECTED: telemetry signature invalid")
                     send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
 
                 session_id = packet["session_id"]
 
                 if session_id not in sessions:
-                    dlog("GROUND", "WARN", "Telemetry arrived before session existed", sid=session_id, mid=message_id)
+                    print(f"[GROUND] WARN: telemetry before session ({session_id})")
                     send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
 
@@ -741,29 +720,27 @@ while True:
                 replay_window = replay_windows[session_id]
 
                 if session.is_expired():
-                    dlog("GROUND", "REJECT", "Session expired", sid=session_id, mid=message_id)
+                    print(f"[GROUND] REJECTED: session expired ({session_id})")
                     send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
 
-                # -----------------------------------------------------
-                # Ciphertext proof block
-                # -----------------------------------------------------
                 if DEBUG_SHOW_CIPHERTEXT:
                     ciphertext_b64 = packet["ciphertext"]
                     nonce_b64 = packet["nonce"]
 
-                    section("Encrypted Telemetry View (before decrypt)")
-                    kv("Algorithms", "ML-KEM-1024 + AES-GCM + ML-DSA-65")
-                    kv("Session ID", packet["session_id"])
-                    kv("Nonce", nonce_b64)
-                    kv("Nonce len", f"{len(nonce_b64)} base64 chars")
-                    kv(
-                        "Ciphertext",
-                        f"{ciphertext_b64[:CIPHERTEXT_PREVIEW_LEN]}"
-                        f"{'...' if len(ciphertext_b64) > CIPHERTEXT_PREVIEW_LEN else ''}",
+                    print("-" * 72)
+                    print("Encrypted Telemetry View (before decrypt)")
+                    print("Algorithms : Session key via ML-KEM-1024 | Payload encrypted with AES-GCM | Packet signed with ML-DSA-65")
+                    print(f"Session ID  : {packet['session_id']}")
+                    print(f"Nonce       : {nonce_b64}")
+                    print(f"Nonce len   : {len(nonce_b64)} base64 chars")
+                    print(
+                        f"Ciphertext  : {ciphertext_b64[:CIPHERTEXT_PREVIEW_LEN]}"
+                        f"{'...' if len(ciphertext_b64) > CIPHERTEXT_PREVIEW_LEN else ''}"
                     )
-                    kv("CT length", f"{len(ciphertext_b64)} base64 chars")
-
+                    print(f"CT length   : {len(ciphertext_b64)} base64 chars")
+                    print("-" * 72)
+                    
                 plaintext = decrypt(
                     b64d(packet["nonce"]),
                     b64d(packet["ciphertext"]),
@@ -772,17 +749,14 @@ while True:
                 )
 
                 frame = parse_json_bytes(plaintext)
+
                 sequence = int(frame["sequence"])
 
                 decision = replay_window.check(sequence)
                 if not decision.accepted:
-                    dlog(
-                        "GROUND",
-                        "REJECT",
-                        "Replay blocked",
-                        session=session_id,
-                        seq=sequence,
-                        reason=decision.reason,
+                    print(
+                        f"[GROUND] REJECTED: replay blocked "
+                        f"(session={session_id}, seq={sequence}, reason={decision.reason})"
                     )
                     send_nack(session_id=session_id, message_id=message_id, missing=[0])
                     continue
@@ -794,10 +768,8 @@ while True:
                 if previous_max != -1 and sequence > previous_max + 1:
                     gap = sequence - previous_max - 1
 
-                detection = detector.detect(frame)
                 payload = frame["payload"]
 
-                # Convert decrypted payload into a richer human-readable telemetry object.
                 telemetry = Telemetry(
                     seq=sequence,
                     timestamp=float(frame["timestamp"]),
@@ -810,81 +782,59 @@ while True:
                     bus_v=float(payload["bus_v"]),
                     bus_i=float(payload["bus_i"]),
                 )
+                
+                feature_logger.log(telemetry.to_feature_dict())
 
-                dlog(
-                    "GROUND",
-                    "TELEMETRY_RX",
-                    "Secure telemetry packet accepted",
-                    seq=sequence,
-                    session=session_id,
-                    apid=frame["apid"],
-                )
+                detection = detector.detect(telemetry)
+                
+
+                print("=" * 72)
+                print("AegisLEO Secure Telemetry Packet")
+                print(f"Spacecraft : {frame['spacecraft_id']}")
+                print(f"Session ID : {session_id}")
+                print(f"Timestamp  : {pretty_time(frame['timestamp'])}")
+                print(f"APID       : {frame['apid']}")
+                print(f"Sequence   : {sequence}")
+                print(f"Gap        : {gap}")
+                print(f"Replay     : ACCEPTED ({decision.reason})")
+                print("Crypto     : signature=VALID, session=ACTIVE, decrypt=SUCCESS")
+                print("Proof      : ciphertext shown above, plaintext shown below after AES-GCM decrypt")
 
                 if detection.is_anomalous:
-                    dlog(
-                        "GROUND",
-                        "ML_ALERT",
-                        "Anomalous telemetry detected",
-                        seq=sequence,
-                        score=detection.score,
-                        reasons=detection.reasons,
+                    print(
+                        f"ML         : ANOMALY "
+                        f"(score={detection.score}, reasons={detection.reasons})"
                     )
                 else:
-                    dlog(
-                        "GROUND",
-                        "ML_OK",
-                        "Telemetry classified as nominal",
-                        seq=sequence,
-                        score=detection.score,
-                    )
+                    print(f"ML         : nominal (score={detection.score})")
 
-                banner("AegisLEO Secure Telemetry Packet")
-                kv("Spacecraft", frame["spacecraft_id"])
-                kv("Session ID", session_id)
-                kv("Timestamp", pretty_time(frame["timestamp"]))
-                kv("APID", frame["apid"])
-                kv("Sequence", sequence)
-                kv("Gap", gap)
-                kv("Replay", f"ACCEPTED ({decision.reason})")
-                kv(
-                    "Crypto",
-                    crypto_verdict(
-                        signature_valid=True,
-                        session_active=True,
-                        decrypt_ok=True,
-                    ),
-                )
-                kv(
-                    "ML",
-                    ml_verdict(
-                        detection.is_anomalous,
-                        detection.score,
-                        detection.reasons,
-                    ),
-                )
-                kv("Proof", "ciphertext shown above, plaintext shown below after AES-GCM decrypt")
-
-                section("Telemetry Operator View")
-                for key, value in telemetry.operator_lines():
-                    kv(key, value)
-
-                section("Telemetry Summary")
-                print(telemetry.summary(), flush=True)
+                print(f"Summary    : {telemetry.summary()}")
+                print("=" * 72)
 
                 send_ack(session_id, message_id)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
             except Exception as exc:
-                dlog(
-                    "GROUND",
-                    "REJECT",
-                    "Telemetry processing failed",
-                    sid=session_id,
-                    mid=message_id,
-                    error=str(exc),
+                print(
+                    f"[GROUND] REJECTED: telemetry processing failed "
+                    f"sid={session_id} mid={message_id}: {exc}"
                 )
                 send_nack(session_id=session_id, message_id=message_id, missing=[0])
 
         print_stats()
 
     except Exception as exc:
-        dlog("GROUND", "WARN", "Top-level receiver loop exception", error=str(exc))
+        print(f"[GROUND] WARN: {exc}")
