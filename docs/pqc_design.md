@@ -28,60 +28,68 @@ Classical key exchange (RSA, ECDH) and digital signatures (ECDSA) are vulnerable
 ```
 Boot / session start:
   Ground station generates ML-KEM-1024 keypair
-  Public key distributed to satellite (out-of-band, pre-provisioned)
+  Public key is pre-provisioned to the satellite (out-of-band)
 
 Per session:
-  Satellite encapsulates shared_secret → (ciphertext, shared_secret)
-  Satellite sends ciphertext to ground station in session_init packet
+  Satellite performs ML-KEM encapsulation → (ciphertext, shared_secret)
+  Satellite sends ciphertext inside a session_init packet
   Ground station decapsulates → shared_secret
   Both sides derive AES-256 key via HKDF-SHA256(shared_secret, salt, info)
 
 Per packet:
-  Satellite signs canonical_json(packet_core) with ML-DSA-65 secret key
-  Satellite encrypts signed packet with AES-256-GCM session key
-  Ground station decrypts, then verifies ML-DSA-65 signature
+  Satellite signs canonical JSON of the packet core with ML-DSA-65
+  Satellite encrypts the signed packet with the session AES key
+  Ground station decrypts, then verifies the ML-DSA-65 signature
 ```
 
 ### Key Storage
 
-| Key | Location | Notes |
-|---|---|---|
-| `satellite_mldsa_secret.key` | Satellite node only (`keys/`) | Never leaves Pi 5 |
-| `satellite_mldsa_public.key` | Ground station (`keys/`) | Public — safe to distribute |
-| `receiver_kem_private.key` | Ground station only (`dev_secrets/`) | Never leaves Jetson |
-| `receiver_kem_public.key` | Satellite node (`dev_secrets/satellite/`) | Public — safe to distribute |
+| Key                            | Location                          | Notes                          |
+|--------------------------------|-----------------------------------|--------------------------------|
+| `satellite_mldsa_secret.key`   | Satellite only (`keys/`)          | Never leaves the Pi 5          |
+| `satellite_mldsa_public.key`   | Ground station (`keys/`)          | Public                         |
+| `receiver_kem_private.key`     | Ground station only (`dev_secrets/`) | Never leaves the Jetson     |
+| `receiver_kem_public.key`      | Satellite (`dev_secrets/satellite/`) | Public                      |
 
-All key files are excluded from version control via `.gitignore`. Generate fresh keys with `python tools/generate_keys.py`.
+All secret material is excluded from version control via `.gitignore`. Fresh keys are generated with the scripts in `tools/`.
 
 ---
 
 ## Implementation
 
-All post-quantum primitives are provided by [liboqs](https://github.com/open-quantum-safe/liboqs) (Open Quantum Safe project) via the [liboqs-python](https://github.com/open-quantum-safe/liboqs-python) bindings. liboqs implements FIPS 203 and FIPS 204 using the reference implementations with optional AVX2 optimization.
+Post-quantum primitives are supplied by [liboqs](https://github.com/open-quantum-safe/liboqs) through the [liboqs-python](https://github.com/open-quantum-safe/liboqs-python) bindings.
 
-Key wrapper modules:
-- `crypto/pq_kem.py` — ML-KEM-1024 keygen, encapsulate, decapsulate
-- `crypto/mldsa_signatures.py` — ML-DSA-65 keygen, sign, verify
-- `crypto/key_manager.py` — end-to-end session key establishment + HKDF derivation
-- `crypto/aes_gcm.py` — AES-256-GCM encrypt/decrypt via `cryptography` library
+| Module                        | Responsibility                              |
+|-------------------------------|---------------------------------------------|
+| `crypto/pq_kem.py`            | ML-KEM-1024 keygen / encapsulate / decapsulate |
+| `crypto/mldsa_signatures.py`  | ML-DSA-65 keygen / sign / verify            |
+| `crypto/key_manager.py`       | Session establishment + HKDF                |
+| `crypto/aes_gcm.py`           | AES-256-GCM encrypt / decrypt               |
 
 ---
 
-## Performance Notes
+## Performance Observations
 
-ML-KEM and ML-DSA operations on the Raspberry Pi 5 (ARM Cortex-A76) and Jetson Orin Nano (ARM Cortex-A78AE) are fast enough for a low-rate telemetry downlink. Session key exchange (ML-KEM encapsulate + decapsulate) adds ~5–15ms per session. Per-packet ML-DSA-65 signing adds ~10–30ms depending on load. These costs are acceptable at AegisLEO's telemetry cadence but would require hardware acceleration (e.g. Hailo-10H) for high-rate applications.
+On the Raspberry Pi 5 and Jetson Orin Nano the chosen parameter sets are fast enough for low-rate telemetry:
 
-Benchmark scripts: `experiments/pqc_benchmarks.py`
+- ML-KEM encapsulate + decapsulate: roughly 5–15 ms per session
+- ML-DSA-65 sign: roughly 10–30 ms per packet (load-dependent)
+
+Session establishment is a one-time cost. After the AES session key is derived, per-packet overhead is dominated by AES-GCM and is negligible at the testbed’s telemetry cadence. High-rate applications would benefit from hardware acceleration.
+
+Benchmark scripts live in `experiments/`.
 
 ---
 
 ## Threat Model
 
-| Threat | Mitigation |
-|---|---|
-| Passive eavesdropping | AES-256-GCM encryption |
-| Key recovery via quantum computer | ML-KEM-1024 (post-quantum KEM) |
-| Packet forgery | ML-DSA-65 signatures |
-| Replay attack | Sliding replay window (`groundstation/replay_window.py`) |
-| Behavioral anomaly (passes crypto) | Autoencoder ThreatScore |
-| Harvest now, decrypt later | ML-KEM session keys — quantum-safe |
+| Threat                              | Mitigation                                      |
+|-------------------------------------|-------------------------------------------------|
+| Passive eavesdropping               | AES-256-GCM                                     |
+| Quantum key recovery                | ML-KEM-1024                                     |
+| Packet forgery                      | ML-DSA-65 signatures                            |
+| Replay                              | Sliding replay window                           |
+| Behavioral anomaly (crypto passes)  | Independent sequence autoencoder                |
+| Harvest-now-decrypt-later           | Post-quantum session keys                       |
+
+The cryptographic layer and the ML anomaly layer are intentionally independent. Compromise or bypass of one does not disable the other.
