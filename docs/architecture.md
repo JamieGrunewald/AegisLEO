@@ -4,9 +4,7 @@
 
 AegisLEO is a hardware-in-the-loop testbed that simulates a satellite telemetry downlink with post-quantum cryptographic protection and ML-based anomaly detection. The system comprises three physical nodes and one adversary node, connected over a real RF link.
 
-```
-![AegisLEO System Architecture](docs/images/aegisleo-architecture.jpg)
-```
+![AegisLEO System Architecture](images/aegisleo-architecture.jpg)
 
 ---
 
@@ -84,7 +82,7 @@ Primary code: `adversary/kali-inj-bridge.py` and related tools
 
 ## Transport Framing
 
-Each logical packet is chunked to fit the LoRa DTU limit (~240 bytes wire size) and wrapped in a byte-stuffed transport frame:
+Logical packets are chunked to fit the LoRa DTU and wrapped in a byte-stuffed frame:
 
 ```
 FRAME_START (0x7E)
@@ -97,9 +95,17 @@ Byte-stuffing ensures `0x7E`, `0x7F`, and `0x7D` never appear raw in the length 
 
 ---
 
+## Design Principles
+
+- Cryptographic verification and behavioral anomaly detection are independent layers.
+- All security-relevant constants and key material are kept out of version control.
+- The testbed prioritizes measurability and adversarial realism over production polish.
+- Hardware choices (Pi 5 + Jetson Orin + SX1262) were selected to force confrontation with real resource and RF constraints.
 ## v2.0 Planned Changes
 
 - Replace SX1262 LoRa with HackRF One (TX) + RTL-SDR v4 (RX) for true over-the-air testing
 - GNU Radio channel model (Doppler, AWGN)
 - InfluxDB + Grafana for live ThreatScore dashboards
 - Hailo-10H for on-board ML acceleration
+
+---
