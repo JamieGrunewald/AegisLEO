@@ -66,46 +66,46 @@ The composite **ThreatScore** weights three signals:
 
 ```
 AegisLEO/
-├── satellite/          # Transmitter — runs on Raspberry Pi 5
-│   ├── transmitter.py          # Active: LoRa + PQC + chunked framing (v0.13.0)
-│   └── transmitter_legacy.py  # Historical: early LoRa version (reference only)
-├── groundstation/      # Receiver + detection pipeline — runs on Jetson Orin
-│   ├── receiver.py             # Active: full secure receive loop
-│   ├── reassembly.py           # Chunk reassembly (ReassemblyFactory)
-│   ├── replay_window.py        # Sliding replay protection window
-│   └── feature_logger.py      # ML training data collection (CSV)
-├── adversary/          # Attack tools for detection pipeline testing
-│   ├── kali-inj-bridge.py     # Demo injection: spike / drift / flatline profiles
-│   ├── replay_attack.py        # Packet replay (v2.0 stub)
-│   ├── packet_fuzzer.py        # Transport-layer frame fuzzer (v2.0 stub)
-│   ├── telemetry_sniffer.py    # Passive frame capture (v2.0 stub)
-│   └── mitm_proxy.py           # MITM proxy (v2.0 stub)
-├── crypto/             # Post-quantum cryptographic primitives
-│   ├── pq_kem.py               # ML-KEM-1024 (FIPS 203)
-│   ├── mldsa_signatures.py     # ML-DSA-65 (FIPS 204)
-│   ├── aes_gcm.py              # AES-256-GCM
-│   └── key_manager.py          # Session key establishment + HKDF
-├── ccsds/              # CCSDS Space Packet Protocol framing
-│   ├── frame.py                # Active: frame build/parse, canonical JSON
-│   ├── packet.py               # Compatibility shim → re-exports frame.py
-│   ├── ccsds_telemetry.py      # CCSDS telemetry type definitions (v2.0 stub)
-│   └── telemetry_builder.py    # Typed frame builder (v2.0 stub)
-├── common/             # Shared utilities
-│   ├── telemetry_model.py      # Telemetry dataclass (ML features, validation, mutation)
-│   ├── demo_log.py             # Structured demo output helpers
-│   ├── protocol.py             # Binary packet protocol (early prototype)
-│   └── chunking.py             # Chunk envelope helpers (v2.0 planned)
-├── models/             # Anomaly detection
-│   ├── generate_normal_dataset.py  # Synthetic training data generator
-│   ├── window_dataset.py           # Sliding window dataset builder
-│   ├── train_seq_autoencoder.py    # Autoencoder training script
-│   └── runtime_detector.py         # Live inference interface
-├── radio/              # LoRa radio abstraction (v2.0 stub)
-├── experiments/        # PQC benchmarks, LoRa throughput, packet sizing
-├── tools/              # Key generation, session bootstrap, inspection utilities
-├── tests/              # pytest suite
-├── config/             # Runtime configuration YAMLs (v2.0 — not yet loaded at runtime)
-└── docs/               # Architecture, PQC design, protocol spec
+├── satellite/                       # Transmitter — runs on Raspberry Pi 5
+│   ├── transmitter.py                   # Active: LoRa + PQC + chunked framing (v0.13.0)
+│   └── transmitter_legacy.py            # Historical: early LoRa version (reference only)
+├── groundstation/                  # Receiver + detection pipeline — runs on Jetson Orin
+│   ├── receiver.py                     # Active: full secure receive loop
+│   ├── reassembly.py                   # Chunk reassembly (ReassemblyFactory)
+│   ├── replay_window.py                # Sliding replay protection window
+│   └── feature_logger.py               # ML training data collection (CSV)
+├── adversary/                      # Attack tools for detection pipeline testing
+│   ├── kali-inj-bridge.py              # Demo injection: spike / drift / flatline profiles
+│   ├── replay_attack.py                # Packet replay (v2.0 stub)
+│   ├── packet_fuzzer.py                # Transport-layer frame fuzzer (v2.0 stub)
+│   ├── telemetry_sniffer.py            # Passive frame capture (v2.0 stub)
+│   └── mitm_proxy.py                   # MITM proxy (v2.0 stub)
+├── crypto/                         # Post-quantum cryptographic primitives
+│   ├── pq_kem.py                       # ML-KEM-1024 (FIPS 203)
+│   ├── mldsa_signatures.py             # ML-DSA-65 (FIPS 204)
+│   ├── aes_gcm.py                      # AES-256-GCM
+│   └── key_manager.py                  # Session key establishment + HKDF
+├── ccsds/                          # CCSDS Space Packet Protocol framing
+│   ├── frame.py                        # Active: frame build/parse, canonical JSON
+│   ├── packet.py                       # Compatibility shim → re-exports frame.py
+│   ├── ccsds_telemetry.py              # CCSDS telemetry type definitions (v2.0 stub)
+│   └── telemetry_builder.py            # Typed frame builder (v2.0 stub)
+├── common/                         # Shared utilities
+│   ├── telemetry_model.py              # Telemetry dataclass (ML features, validation, mutation)
+│   ├── demo_log.py                     # Structured demo output helpers
+│   ├── protocol.py                     # Binary packet protocol (early prototype)
+│   └── chunking.py                     # Chunk envelope helpers (v2.0 planned)
+├── models/                         # Anomaly detection
+│   ├── generate_normal_dataset.py      # Synthetic training data generator
+│   ├── window_dataset.py               # Sliding window dataset builder
+│   ├── train_seq_autoencoder.py        # Autoencoder training script
+│   └── runtime_detector.py             # Live inference interface
+├── radio/                          # LoRa radio abstraction (v2.0 stub)
+├── experiments/                    # PQC benchmarks, LoRa throughput, packet sizing
+├── tools/                          # Key generation, session bootstrap, inspection utilities
+├── tests/                          # Pytest suite
+├── config/                         # Runtime configuration YAMLs (v2.0 — not yet loaded at runtime)
+└── docs/                           # Architecture, PQC design, protocol spec
 ```
 
 ---
@@ -148,7 +148,7 @@ Produces `dev_secrets/groundstation/receiver_kem_private.key` (Jetson only) and 
 ### Run
 
 **Satellite node (Pi 5):**
-```bash
+```bash  
 python -m satellite.transmitter
 ```
 
