@@ -5,7 +5,7 @@
 AegisLEO is a hardware-in-the-loop testbed that simulates a satellite telemetry downlink with post-quantum cryptographic protection and ML-based anomaly detection. The system comprises three physical nodes and one adversary node, connected over a real RF link.
 
 ```
-![AegisLEO System Architecture](images/aegisleo-architecture.jpeg)
+![AegisLEO System Architecture](images/aegisleo-architecture.jpg)
 ```
 
 ---
