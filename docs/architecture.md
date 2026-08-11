@@ -5,29 +5,7 @@
 AegisLEO is a hardware-in-the-loop testbed that simulates a satellite telemetry downlink with post-quantum cryptographic protection and ML-based anomaly detection. The system comprises three physical nodes and one adversary node, connected over a real RF link.
 
 ```
-┌─────────────────────┐        LoRa RF        ┌──────────────────────────┐
-│  Satellite Node     │ ──────────────────▶   │  Ground Station          │
-│  Raspberry Pi 5     │                        │  NVIDIA Jetson Orin Nano │
-│                     │ ◀──────────────────    │  Super                   │
-│  - ML-KEM-1024 KEM  │     ACK / NACK         │                          │
-│  - ML-DSA-65 sign   │                        │  - ML-KEM decapsulate    │
-│  - AES-256-GCM enc  │                        │  - ML-DSA-65 verify      │
-│  - CCSDS framing    │                        │  - AES-256-GCM decrypt   │
-│  - LoRa TX (SX1262) │                        │  - Replay window check   │
-└─────────────────────┘                        │  - Autoencoder scoring   │
-                                               │  - ThreatScore output    │
-         ▲                                     └──────────────────────────┘
-         │ injected frames
-┌─────────────────────┐
-│  Adversary Node     │
-│  Kali Linux VM      │
-│  (darpa-01, Proxmox)│
-│                     │
-│  - Replay attack    │
-│  - Packet fuzzer    │
-│  - MITM proxy       │
-│  - Spoofed CCSDS    │
-└─────────────────────┘
+![AegisLEO System Architecture](images/aegisleo-architecture.jpeg)
 ```
 
 ---
