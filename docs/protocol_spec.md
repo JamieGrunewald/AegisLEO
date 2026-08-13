@@ -105,7 +105,7 @@ The satellite retransmits only the missing chunks listed in the NACK.
 
 ## Session State Machine
 
-![AegisLEO Sessnion State Machine](images/SessionState.png)
+![AegisLEO Sessnion State Machine](images/aegisleo-sessionstate.png)
 
 ---
 
