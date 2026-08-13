@@ -13,7 +13,7 @@
 
 ## What it is
 
-AegisLEO is a research testbed for evaluating post-quantum cryptographic protections applied to satellite telemetry in a realistic adversarial environment. It implements a full ground-to-satellite link using physical LoRa radio hardware, with a dedicated adversary node that injects spoofed and replayed CCSDS packets to simulate real attack scenarios.
+AegisLEO is a research testbed for evaluating post-quantum cryptographic protections applied to satellite telemetry in a realistic adversarial environment. It implements a full ground-to-satellite link using physical LoRa radio hardware, with a dedicated adversary node that injects spoofed and replayed CCSDS packets to simulate real attack scenarios. The working system was demonstrated at home; screenshots and recorded metrics were presented at CypherCon 9.
 
 The system is designed around two core questions:
 
