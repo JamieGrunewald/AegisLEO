@@ -105,27 +105,7 @@ The satellite retransmits only the missing chunks listed in the NACK.
 
 ## Session State Machine
 
-```
-
 ![AegisLEO Sessnion State Machine](images/SessionState.png)
-
-Satellite                          Ground Station
-   │                                     │
-   │── session_init ──────────────────▶  │  ML-KEM decapsulate
-   │                                     │  derive AES session key
-   │  ◀─────────────────────────── ACK ──│
-   │                                     │
-   │── telemetry chunk 0/N ───────────▶  │
-   │── telemetry chunk 1/N ───────────▶  │
-   │── telemetry chunk N/N ───────────▶  │  reassemble
-   │                                     │  verify ML-DSA-65
-   │                                     │  AES-256-GCM decrypt
-   │                                     │  replay window check
-   │                                     │  autoencoder score
-   │  ◀─────────────────────────── ACK ──│  (or NACK if missing chunks)
-   │                                     │
-   │  [repeat for each telemetry sample] │
-```
 
 ---
 
