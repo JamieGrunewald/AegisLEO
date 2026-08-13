@@ -107,7 +107,7 @@ The satellite retransmits only the missing chunks listed in the NACK.
 
 ```
 
-![AegisLEO Session State Machine](images/SessionState.png)
+![AegisLEO Sessnion State Machine](images/SessionState.png)
 
 Satellite                          Ground Station
    │                                     │
