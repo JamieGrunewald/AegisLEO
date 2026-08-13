@@ -7,7 +7,9 @@
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi%205%20%7C%20Jetson%20Orin-green)
 ![Crypto](https://img.shields.io/badge/crypto-ML--KEM--1024%20%7C%20ML--DSA--65%20%7C%20AES--256--GCM-orange)
 
-> Presented at **CypherCon 9** — Milwaukee, WI — April 2026
+> Presented at **CypherCon 9** — Milwaukee, WI — April 2026  
+> (Results and screenshots from a home demonstration; live RF demo was not run at the conference.)  
+> [Talk slides (PDF)](docs/AegisLEO_CypherCon9_2026.pdf)
 
 ---
 
