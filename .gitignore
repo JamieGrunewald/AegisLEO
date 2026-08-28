@@ -71,3 +71,23 @@ keys/
 
 # Temp / cleanup
 _cleanup_quarantine_*/
+
+# liboqs build artifacts — do not commit
+liboqs/
+*.so
+*.so.*
+*.a
+
+# Swap files
+*.swp
+*.swo
+
+# liboqs build artifacts — do not commit
+liboqs/
+*.so
+*.so.*
+*.a
+
+# Swap files
+*.swp
+*.swo
