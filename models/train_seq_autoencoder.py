@@ -39,7 +39,7 @@ WINDOW_SIZE = 4
 BATCH_SIZE = 8
 
 # Number of training passes
-EPOCHS = 20
+EPOCHS = 100
 
 
 # ================================
@@ -131,7 +131,7 @@ def main():
     print(model)
 
     # Optimizer = how model learns
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     # Loss = reconstruction error
     loss_fn = nn.MSELoss()
